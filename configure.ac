@@ -201,8 +201,6 @@ MP_COMPILER_ATTRIBUTE_UNUSED
 
 MP_PROG_DAEMONDO
 
-AC_SUBST(EXTRA_PROGS)
-
 # Check for paths
 AC_PREFIX_DEFAULT(/opt/local)
 AC_ARG_WITH(
@@ -269,6 +267,14 @@ AC_SUBST(HAVE_ARC4RANDOM_BUF, $ac_cv_func_arc4random_buf)
 AC_SUBST(HAVE_GETENTROPY, $ac_cv_func_getentropy)
 AC_SUBST(HAVE_TIMINGSAFE_BCMP, $ac_cv_func_timingsafe_bcmp)
 
+# For vendor/install
+AC_CHECK_DECLS([CLONE_NOOWNERCOPY], [], [], [[#include <sys/clonefile.h>]])
+AC_SUBST(HAVE_CLONEFILE, $ac_cv_func_clonefile)
+AC_SUBST(HAVE_DECL_CLONE_NOOWNERCOPY, $ac_cv_have_decl_CLONE_NOOWNERCOPY)
+if test x$ac_cv_func_clonefile = xyes -a x$ac_cv_have_decl_CLONE_NOOWNERCOPY = xyes; then
+AC_CONFIG_FILES([vendor/install/Makefile])
+fi
+
 # Check for library functions, replacements are in pextlib1.0/compat/
 AC_CHECK_FUNCS([getline getdelim strlcat strlcpy])
 AC_SUBST(HAVE_GETDELIM, $ac_cv_func_getdelim)
@@ -305,6 +311,13 @@ AC_DEFINE([MIN_USABLE_GID], [501], [Lowest non-system-reserved GID.])
 
 # Substitute platform for base compatibility check
 MP_PLATFORM
+
+# For programs/cp - the -c option was added in 10.13
+if test "$OS_PLATFORM" = darwin -a "$OS_MAJOR" -ge 17; then
+EXTRA_PROGS="$EXTRA_PROGS cp"
+AC_CONFIG_FILES([src/programs/cp/Makefile])
+fi
+AC_SUBST(EXTRA_PROGS)
 
 ## libcurl
 MP_LIBCURL_FLAGS
@@ -346,6 +359,11 @@ eval "macports_libexec_dir=${libexecdir}/macports"
 eval "macports_libexec_dir=$macports_libexec_dir"
 prefix=$oldprefix
 exec_prefix=$oldexec_prefix
+
+if test x$ac_cv_func_clonefile = xyes; then
+    CLONEBIN_PATH="${macports_libexec_dir}/clonebin"
+fi
+AC_SUBST(CLONEBIN_PATH)
 
 ## Tcl package
 MP_CONFIG_SUBDIR([vendor/tcl/unix], [--prefix=${macports_libexec_dir} --enable-threads])

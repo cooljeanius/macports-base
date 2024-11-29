@@ -126,7 +126,19 @@ proc portdestroot::destroot_start {args} {
 }
 
 proc portdestroot::destroot_main {args} {
-    command_exec -callback portprogress::target_progress_callback destroot
+    global system_options
+    if {$system_options(clonebin_path) ne ""} {
+        global env
+        set saved_path $env(PATH)
+        set env(PATH) $system_options(clonebin_path):$env(PATH)
+    }
+    try {
+        command_exec -callback portprogress::target_progress_callback destroot
+    } finally {
+        if {[info exists saved_path]} {
+            set env(PATH) $saved_path
+        }
+    }
     return 0
 }
 
@@ -201,15 +213,9 @@ proc portdestroot::destroot_finish {args} {
         return -code error "Staging $subport into destroot failed"
     }
 
-    # Compress all manpages with gzip (instead) if not building for a
-    # platform where the system tar supports --hfsCompression,
-    # i.e. macOS 10.15 (darwin 19) or later.
-    lassign [_get_compatible_platform] compat_os_platform compat_os_major
+    # Compress all manpages with gzip (instead)
     set manpath ${destroot}${prefix}/share/man
-    if {($compat_os_platform ne "darwin" || ![string is integer -strict $compat_os_major]
-        || $compat_os_major < 19 || [getuid] != 0)
-        && [file isdirectory ${manpath}] && [file type ${manpath}] eq "directory"
-    } then {
+    if {[file isdirectory ${manpath}] && [file type ${manpath}] eq "directory"} {
         ui_info "$UI_PREFIX [format [msgcat::mc "Compressing man pages for %s"] ${subport}]"
 
         set gzip [findBinary gzip ${portutil::autoconf::gzip_path}]
@@ -375,6 +381,27 @@ proc portdestroot::destroot_finish {args} {
         }
     } else {
         ui_warn "[format [msgcat::mc "%s installs files outside the common directory structure."] $subport]"
+    }
+
+    # Work around apparent filesystem bug.
+    # https://trac.macports.org/ticket/67336
+    if {![catch {fs_clone_capable $destroot} result] && $result} {
+        global workpath
+        ui_debug "Applying sparse file lseek bug workaround"
+        try {
+            fs-traverse -depth fullpath [list $destroot] {
+                if {[file type $fullpath] eq "file" && [fileIsSparse $fullpath]} {
+                    ui_debug "Cloning $fullpath for workaround"
+                    clonefile $fullpath ${workpath}/.macports-sparse-workaround
+                    file delete ${workpath}/.macports-sparse-workaround
+                    if {![fileIsSparse $fullpath]} {
+                        ui_debug "$fullpath is no longer sparse"
+                    }
+                }
+            }
+        } on error {eMessage} {
+            ui_debug "Error while applying sparse file workaround: $eMessage"
+        }
     }
 
     # Restore umask

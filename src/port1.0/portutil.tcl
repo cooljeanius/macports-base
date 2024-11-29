@@ -2784,8 +2784,8 @@ proc archiveTypeIsSupported {type} {
     return -code error [format [msgcat::mc "Unsupported port archive type '%s': %s"] $type $errmsg]
 }
 
-# return the specified piece of metadata from the +CONTENTS file in the given archive
-proc extract_archive_metadata {archive_location archive_type metadata_type} {
+# return the specified pieces of metadata from the +CONTENTS file in the given archive
+proc extract_archive_metadata {archive_location archive_type metadata_types} {
     set qflag ${portutil::autoconf::tar_q}
     set raw_contents ""
 
@@ -2807,7 +2807,19 @@ proc extract_archive_metadata {archive_location archive_type metadata_type} {
     switch -- $archive_type {
         tbz -
         tbz2 {
-            set raw_contents [exec -ignorestderr [findBinary tar ${portutil::autoconf::tar_path}] -xOj${qflag}f $archive_location ./+CONTENTS]
+            global os.major os.platform
+            if {${os.major} == 8 && ${os.platform} eq "darwin"} {
+                # https://trac.macports.org/ticket/70622
+                set tar_cmd [string cat [findBinary tar ${portutil::autoconf::tar_path}] \
+                     " -xOj${qflag}f [shellescape $archive_location] ./+CONTENTS" \
+                     " 2>/dev/null || true"]
+                set raw_contents [exec -ignorestderr /bin/sh -c $tar_cmd]
+                if {$raw_contents eq ""} {
+                    error "extracting +CONTENTS from $archive_location failed"
+                }
+            } else {
+                set raw_contents [exec -ignorestderr [findBinary tar ${portutil::autoconf::tar_path}] -xOj${qflag}f $archive_location ./+CONTENTS]
+            }
         }
         tgz {
             set raw_contents [exec -ignorestderr [findBinary tar ${portutil::autoconf::tar_path}] -xOz${qflag}f $archive_location ./+CONTENTS]
@@ -2843,52 +2855,63 @@ proc extract_archive_metadata {archive_location archive_type metadata_type} {
         close $fd
         file delete -force $tempdir
     }
-    if {$metadata_type eq "contents"} {
-        set contents [list]
-        set binary_info [list]
-        set ignore 0
-        set sep [file separator]
-        foreach line [split $raw_contents \n] {
-            if {$ignore} {
+    set ret [dict create]
+    foreach metadata_type $metadata_types {
+        switch -- $metadata_type {
+            contents {
+                set contents [list]
+                set binary_info [list]
                 set ignore 0
-                continue
-            }
-            if {[string index $line 0] ne "@"} {
-                lappend contents "${sep}${line}"
-            } elseif {$line eq "@ignore"} {
-                set ignore 1
-            } elseif {[string range $line 0 15] eq "@comment binary:"} {
-                lappend binary_info [lindex $contents end] [string range $line 16 end]
-            }
-        }
-        return [list $contents $binary_info]
-    } elseif {$metadata_type eq "portname"} {
-        foreach line [split $raw_contents \n] {
-            if {[lindex $line 0] eq "@portname"} {
-                return [lindex $line 1]
-            }
-        }
-        return ""
-    } elseif {$metadata_type eq "cxx_info"} {
-        set val_cxx_stdlib ""
-        set val_cxx_stdlib_overridden ""
-        foreach line [split $raw_contents \n] {
-            if {[lindex $line 0] eq "@cxx_stdlib"} {
-                set val_cxx_stdlib [lindex $line 1]
-                if {$val_cxx_stdlib_overridden ne ""} {
-                    break
+                set sep [file separator]
+                foreach line [split $raw_contents \n] {
+                    if {$ignore} {
+                        set ignore 0
+                        continue
+                    }
+                    if {[string index $line 0] ne "@"} {
+                        lappend contents "${sep}${line}"
+                    } elseif {$line eq "@ignore"} {
+                        set ignore 1
+                    } elseif {[string range $line 0 15] eq "@comment binary:"} {
+                        lappend binary_info [lindex $contents end] [string range $line 16 end]
+                    }
                 }
-            } elseif {[lindex $line 0] eq "@cxx_stdlib_overridden"} {
-                set val_cxx_stdlib_overridden [lindex $line 1]
-                if {$val_cxx_stdlib ne ""} {
-                    break
+                dict set ret contents [list $contents $binary_info]
+            }
+            portname {
+                set portname {}
+                foreach line [split $raw_contents \n] {
+                    if {[lindex $line 0] eq "@portname"} {
+                        set portname [lindex $line 1]
+                        break
+                    }
                 }
+                dict set ret portname $portname
+            }
+            cxx_info {
+                set val_cxx_stdlib ""
+                set val_cxx_stdlib_overridden ""
+                foreach line [split $raw_contents \n] {
+                    if {[lindex $line 0] eq "@cxx_stdlib"} {
+                        set val_cxx_stdlib [lindex $line 1]
+                        if {$val_cxx_stdlib_overridden ne ""} {
+                            break
+                        }
+                    } elseif {[lindex $line 0] eq "@cxx_stdlib_overridden"} {
+                        set val_cxx_stdlib_overridden [lindex $line 1]
+                        if {$val_cxx_stdlib ne ""} {
+                            break
+                        }
+                    }
+                }
+                dict set ret cxx_info [list $val_cxx_stdlib $val_cxx_stdlib_overridden]
+            }
+            default {
+                return -code error "unknown metadata_type: $metadata_type"
             }
         }
-        return [list $val_cxx_stdlib $val_cxx_stdlib_overridden]
-    } else {
-        return -code error "unknown metadata_type: $metadata_type"
     }
+    return $ret
 }
 
 #
@@ -3316,93 +3339,7 @@ proc _check_xcode_version {} {
            xcodecltversion use_xcode xcode_license_unaccepted subport
 
     if {${os.subplatform} eq "macosx"} {
-        switch $macos_version_major {
-            10.4 {
-                set min 2.0
-                set ok 2.4.1
-                set rec 2.5
-            }
-            10.5 {
-                set min 3.0
-                set ok 3.1
-                set rec 3.1.4
-            }
-            10.6 {
-                set min 3.2
-                set ok 3.2
-                set rec 3.2.6
-            }
-            10.7 {
-                set min 4.1
-                set ok 4.1
-                set rec 4.6.3
-            }
-            10.8 {
-                set min 4.4
-                set ok 4.4
-                set rec 5.1.1
-            }
-            10.9 {
-                set min 5.0.1
-                set ok 5.0.1
-                set rec 6.2
-            }
-            10.10 {
-                set min 6.1
-                set ok 6.1
-                set rec 7.2.1
-            }
-            10.11 {
-                set min 7.0
-                set ok 7.0
-                set rec 8.2.1
-            }
-            10.12 {
-                set min 8.0
-                set ok 8.0
-                set rec 9.2
-            }
-            10.13 {
-                set min 9.0
-                set ok 9.0
-                set rec 9.4.1
-            }
-            10.14 {
-                set min 10.0
-                set ok 10.0
-                set rec 10.3
-            }
-            10.15 {
-                set min 11.0
-                set ok 11.3
-                set rec 11.7
-            }
-            11 {
-                set min 12.2
-                set ok 12.2
-                set rec 12.5
-            }
-            12 {
-                set min 13.1
-                set ok 13.1
-                set rec 13.4.1
-            }
-            13 {
-                set min 14.1
-                set ok 14.1
-                set rec 14.3.1
-            }
-            14 {
-                set min 15.0
-                set ok 15.1
-                set rec 15.1
-            }
-            default {
-                set min 15.0
-                set ok 15.1
-                set rec 15.1
-            }
-        }
+        lassign [get_compatible_xcode_versions] min ok rec
         if {$xcodeversion eq "none"} {
             if {[file exists "/Applications/Install Xcode.app"]} {
                 ui_warn "You downloaded Xcode from the Mac App Store but didn't install it. Run \"Install Xcode\" in the /Applications folder."

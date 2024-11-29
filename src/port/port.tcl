@@ -169,17 +169,28 @@ proc registry_installed {portname {portversion ""} {require_single yes} {only_ac
     }
 
     if {[llength $matches] > 1} {
+        global macports::ui_options
         # set portname again since the one we were passed may not have had the correct case
         set portname [[lindex $matches 0] name]
-        ui_notice "The following versions of $portname are currently installed:"
+        set msg "The following versions of $portname are currently installed:"
+        set portilist [list]
         foreach i $matches {
             if {[$i state] eq "installed"} {
-                puts "  $portname @[$i version]_[$i revision][$i variants] (active)"
+                lappend portilist "  $portname @[$i version]_[$i revision][$i variants] (active)"
             } else {
-                puts "  $portname @[$i version]_[$i revision][$i variants]"
+                lappend portilist "  $portname @[$i version]_[$i revision][$i variants]"
             }
         }
-        return -code error "Registry error: Please specify the full version as recorded in the port registry."
+        if {[info exists ui_options(questions_singlechoice)]} {
+            set retindex [$macports::ui_options(questions_singlechoice) $msg "Choice_Q1" $portilist]
+            return [lindex $matches $retindex]
+        } else {
+            ui_notice $msg
+            foreach portstr $portilist {
+                puts $portstr
+            }
+            return -code error "Registry error: Please specify the full version as recorded in the port registry."
+        }
     } elseif {[llength $matches] == 0} {
         if {$portversion eq ""} {
             return -code error "Registry error: $portname not registered as installed."
@@ -2202,15 +2213,17 @@ proc action_activate { action portlist opts } {
     }
     foreachport $portlist {
         set composite_version [composite_version $portversion $variations]
-        if {![dict exists $options ports_activate_no-exec]
-            && ![catch {registry_installed $portname $composite_version} regref]} {
-
-            if {[$regref installtype] eq "image" && [registry::run_target $regref activate $options]} {
-                continue
-            }
+        if {[catch {registry_installed $portname $composite_version} result]} {
+            break_softcontinue "port activate failed: $result" 1 status
+        }
+        set regref $result
+        if {![dict exists $options ports_activate_no-exec] &&
+            [registry::run_target $regref activate $options]
+        } then {
+            continue
         }
         if {![macports::global_option_isset ports_dryrun]} {
-            if { [catch {portimage::activate_composite $portname $composite_version $options} result] } {
+            if {[catch {portimage::activate_composite $portname $composite_version $options} result]} {
                 ui_debug $::errorInfo
                 break_softcontinue "port activate failed: $result" 1 status
             }
@@ -2442,9 +2455,11 @@ proc action_selfupdate { action portlist opts } {
 
     if {[dict get $selfupdate_status base_updated]} {
         # Base was upgraded, re-execute now to trigger sync if possible
-        if {[info exists ui_options(ports_commandfiles)]} {
-            # Batch mode, just exit since re-executing all commands in the file
-            # may not be correct.
+        global argv
+        if {[info exists ui_options(ports_commandfiles)]
+            || {;} in $argv} {
+            # Batch mode or multiple actions on the command line, just exit
+            # since re-executing all actions may not be correct.
             if {[dict get $selfupdate_status needed_portindex]} {
                 ui_msg "Not all sources could be fully synced using the old version of MacPorts."
                 ui_msg "Please run selfupdate again now that MacPorts base has been updated."
@@ -2452,25 +2467,27 @@ proc action_selfupdate { action portlist opts } {
             return -999
         }
 
-        # When re-executing, strip the -f flag to prevent an endless loop
-        set new_argv {}
-        foreach arg $::argv {
-            if {[string match -nocase {-[a-z]*} $arg]} {
-                # map the -f flag to nothing
-                set arg [string map {f ""} $arg]
-                if {$arg eq "-"} {
-                    # if -f was specified alone, just remove the flag completely
-                    continue
+        if {![dict exists $options ports_selfupdate_no-sync] || ![dict get $options ports_selfupdate_no-sync]} {
+            # When re-executing, strip the -f flag to prevent an endless loop
+            set new_argv {}
+            foreach arg $argv {
+                if {[string match -nocase {-[a-z]*} $arg]} {
+                    # map the -f flag to nothing
+                    set arg [string map {f ""} $arg]
+                    if {$arg eq "-"} {
+                        # if -f was specified alone, just remove the flag completely
+                        continue
+                    }
                 }
+                lappend new_argv $arg
             }
-            lappend new_argv $arg
+            # If this returns at all, it failed. Just catch any error to avoid
+            # printing a backtrace at the top level.
+            catch {
+                execl $::argv0 $new_argv
+            }
+            ui_error "Failed to re-execute selfupdate, please run 'sudo port selfupdate' manually."
         }
-        # If this returns at all, it failed. Just catch any error to avoid
-        # printing a backtrace at the top level.
-        catch {
-            execl $::argv0 $new_argv
-        }
-        ui_error "Failed to re-execute selfupdate, please run 'sudo port selfupdate' manually."
         return -999
     }
 
@@ -2567,10 +2584,12 @@ proc action_migrate { action portlist opts } {
     }
     set result [macports::migrate_main $opts]
     if {$result == -999} {
-        global ui_options
-        if {[info exists ui_options(ports_commandfiles)]} {
-            # Batch mode, just exit since re-executing all commands in the file
-            # may not be correct, and we can't really edit their args anyway.
+        global ui_options argv
+        if {[info exists ui_options(ports_commandfiles)]
+            || {;} in $argv} {
+            # Batch mode or multiple actions given, just exit since re-
+            # executing all actions may not be correct (and we can't
+            # really edit the args in a batch file anyway).
             ui_msg "Please run migrate again now that MacPorts base has been updated."
             return -999
         }
@@ -3330,9 +3349,16 @@ proc action_space {action portlist opts} {
         }
         set files [$regref files]
         if {$files != 0 && [llength $files] > 0} {
+            set seen_ino [dict create]
             foreach file $files {
                 catch {
-                    set space [expr {$space + [file size $file]}]
+                    file lstat $file statinfo
+                    if {$statinfo(nlink) == 1 || ![dict exists $seen_ino $statinfo(ino)]} {
+                        set space [expr {$space + $statinfo(size)}]
+                    }
+                    if {$statinfo(nlink) != 1} {
+                        dict set seen_ino $statinfo(ino) 1
+                    }
                 }
             }
             if {![dict exists $options ports_space_total] || [dict get $options ports_space_total] ne "yes"} {
@@ -4206,7 +4232,7 @@ set cmd_opts_array [dict create {*}{
                  depends description epoch exact glob homepage line
                  long_description maintainer maintainers name platform
                  platforms portdir regex revision variant variants version}
-    selfupdate  {migrate no-sync nosync}
+    selfupdate  {migrate no-sync nosync rsync}
     space       {{units 1} total}
     activate    {no-exec}
     deactivate  {no-exec}
@@ -4224,7 +4250,7 @@ set cmd_opts_array [dict create {*}{
     reclaim     {enable-reminders disable-reminders}
     fetch       {no-mirrors}
     bump        {patch}
-    snapshot    {create list {diff 1} all {delete 1} help {note 1}}
+    snapshot    {create list {diff 1} all {delete 1} help {note 1} {export 1} {import 1}}
     restore     {{snapshot-id 1} all last}
     migrate     {continue all}
 }]
@@ -4663,7 +4689,7 @@ proc get_next_cmdline { in out use_readline prompt linename history_file } {
         if { $use_readline && $line ne "" } {
             # Create macports user directory if it does not exist yet
             if {![file isdirectory $macports_user_dir]} {
-                file mkdir macports_user_dir
+                file mkdir $macports_user_dir
 
                 # Also write the history file if this is the case (this sets
                 # the cookie at the top of the file and perhaps other things)
@@ -4894,10 +4920,10 @@ namespace eval portclient::progress {
             intermission -
             finish {
                 # erase to start of line
-                ::term::ansi::send::esol
+                ::term::ansi::send::esolch stderr
                 # return cursor to start of line
-                puts -nonewline "\r"
-                flush stdout
+                puts -nonewline stderr "\r"
+                flush stderr
             }
         }
 
@@ -4949,10 +4975,10 @@ namespace eval portclient::progress {
             }
             finish {
                 # erase to start of line
-                ::term::ansi::send::esol
+                ::term::ansi::send::esolch stderr
                 # return cursor to start of line
-                puts -nonewline "\r"
-                flush stdout
+                puts -nonewline stderr "\r"
+                flush stderr
             }
         }
 
@@ -5052,8 +5078,8 @@ namespace eval portclient::progress {
         # Format the percentage using the space that has been reserved for it
         set percentagesuffix [format " %[expr {$percentageWidth - 3}].1f %%" $percentage]
 
-        puts -nonewline "\r${prefix}\[${progressbar}\]${percentagesuffix}${suffix}"
-        flush stdout
+        puts -nonewline stderr "\r${prefix}\[${progressbar}\]${percentagesuffix}${suffix}"
+        flush stderr
     }
 
 
@@ -5094,8 +5120,8 @@ namespace eval portclient::progress {
             }
         }
 
-        puts -nonewline "\r${prefix}\[${progressbar}\]${suffix}"
-        flush stdout
+        puts -nonewline stderr "\r${prefix}\[${progressbar}\]${suffix}"
+        flush stderr
     }
 }
 
@@ -5537,7 +5563,7 @@ if {[catch {parse_options "global" ui_options global_options} result]} {
     exit 1
 }
 
-if {[isatty stdout]
+if {[isatty stderr]
     && $portclient::progress::hasTermAnsiSend eq "yes"
     && (![info exists ui_options(ports_quiet)] || $ui_options(ports_quiet) ne "yes")} {
     set ui_options(progress_download) portclient::progress::download
@@ -5579,6 +5605,20 @@ if { [llength $remaining_args] == 0 && ![info exists ui_options(ports_commandfil
 if {[catch {mportinit ui_options global_options global_variations} result]} {
     puts $::errorInfo
     fatal "Failed to initialize MacPorts, $result"
+}
+
+# Re-execute if running under Rosetta 2 and not building for x86_64.
+# We know we are a universal binary if this is needed since mportinit
+# would have errored if not.
+if {${macports::os_major} >= 20 && ${macports::os_platform} eq "darwin" &&
+    ${macports::build_arch} ne "x86_64" &&
+    ![info exists global_options(ports_no_migration_check)] &&
+    ![catch {sysctl sysctl.proc_translated} translated] && $translated
+} then {
+    ui_warn "MacPorts started under Rosetta 2, re-executing natively"
+    execl /usr/bin/arch [list -arm64 $::argv0 {*}$::argv]
+    ui_debug "Would have executed $::argv0 $::argv"
+    ui_warn "Failed to re-execute MacPorts... just continuing"
 }
 
 # Change to port directory if requested

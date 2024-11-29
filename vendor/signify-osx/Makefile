@@ -132,7 +132,7 @@ fetch:
 
 install: signify
 	install -d ${BINDIR} ${MANDIR}/man1
-	install -Ss -m 755 signify ${BINDIR}
+	install -S -m 755 signify ${BINDIR}
 	install -S -m 644 signify.1 ${MANDIR}/man1
 
 
@@ -164,7 +164,7 @@ ls:
 	@echo $(FROM_CVS:src/%=%)
 
 clean:
-	rm -rf signify signify.1 test-results explicit_bzero
+	rm -rf signify signify.dSYM signify.1 test-results explicit_bzero
 
 distclean: clean
 	-rm -f autoconf.mk

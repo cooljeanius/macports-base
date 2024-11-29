@@ -291,7 +291,7 @@ options configure.perl configure.python configure.ruby \
 default configure.perl              {}
 default configure.python            {}
 default configure.ruby              {}
-default configure.install           {${portutil::autoconf::install_command}}
+default configure.install           {[expr {$system_options(clonebin_path) ne "" ? [file join $system_options(clonebin_path) install] : ${portutil::autoconf::install_command}}]}
 default configure.awk               {}
 default configure.bison             {}
 default configure.pkg_config        {}
@@ -627,19 +627,21 @@ proc portconfigure::configure_get_sdkroot {sdk_version} {
         set sdks_dir ${developer_dir}/Platforms/MacOSX.platform/Developer/SDKs
     }
 
-    if {$sdk_version eq "10.4"} {
-        set sdk ${sdks_dir}/MacOSX10.4u.sdk
-    } else {
-        set sdk ${sdks_dir}/MacOSX${sdk_version}.sdk
-    }
+    foreach try_path [list ${sdks_dir} ${cltpath}/SDKs] {
+        if {$sdk_version eq "10.4"} {
+            set sdk ${try_path}/MacOSX10.4u.sdk
+        } else {
+            set sdk ${try_path}/MacOSX${sdk_version}.sdk
+        }
 
-    if {[file exists $sdk]} {
-        return $sdk
-    } elseif {$sdk_major >= 11} {
-        # SDKs have minor versions as of macOS 11
-        set sdk [find_close_sdk $sdk_version ${sdks_dir}]
-        if {$sdk ne ""} {
+        if {[file exists $sdk]} {
             return $sdk
+        } elseif {$sdk_major >= 11} {
+            # SDKs have minor versions as of macOS 11
+            set sdk [find_close_sdk $sdk_version ${try_path}]
+            if {$sdk ne ""} {
+                return $sdk
+            }
         }
     }
 
@@ -1902,6 +1904,50 @@ proc portconfigure::configure_main {args} {
     return 0
 }
 
+proc portconfigure::check_warnings {warning_flag} {
+    global \
+        workpath
+
+    set files [list]
+
+    fs-traverse -tails file [list ${workpath}] {
+        if {[file tail $file] in [list config.log CMakeError.log meson-log.txt] && [file isfile [file join ${workpath} $file]]} {
+            # We could do the searching ourselves, but using a tool optimized for this purpose is likely much faster
+            # than using Tcl.
+            #
+            # Using /usr/bin/grep here so we don't accidentally pick up a MacPorts-installed grep which might
+            # currently not be runnable due to a missing library.
+            set args [list "/usr/bin/grep" "-El" "--" "-W[quotemeta $warning_flag]\\\]\$"]
+            lappend args [file join ${workpath} $file]
+
+            if {![catch {exec -- {*}$args}]} {
+                lappend files $file
+            }
+        }
+    }
+
+    if {[llength $files] > 0} {
+        ui_warn [format [msgcat::mc "Configuration logfiles contain indications of %s; check that features were not accidentally disabled:"] "-W$warning_flag"]
+        foreach file $files {
+            ui_msg [format "  found in %s" $file]
+        }
+    }
+}
+
+options configure.checks.implicit_int
+default configure.checks.implicit_int yes
+
+proc portconfigure::check_implicit_int {} {
+    portconfigure::check_warnings {implicit-int}
+}
+
+options configure.checks.incompatible_function_pointer_types
+default configure.checks.incompatible_function_pointer_types yes
+
+proc portconfigure::check_incompatible_function_pointer_types {} {
+    portconfigure::check_warnings {incompatible-function-pointer-types}
+}
+
 options configure.checks.implicit_function_declaration \
         configure.checks.implicit_function_declaration.whitelist
 default configure.checks.implicit_function_declaration yes
@@ -1920,9 +1966,9 @@ proc portconfigure::check_implicit_function_declarations {} {
             # We could do the searching ourselves, but using a tool optimized for this purpose is likely much faster
             # than using Tcl.
             #
-            # Using /usr/bin/fgrep here, so we don't accidentally pick up a macports-installed grep which might
+            # Using /usr/bin/grep here so we don't accidentally pick up a MacPorts-installed grep which might
             # currently not be runnable due to a missing library.
-            set args [list "/usr/bin/fgrep" "--" "-Wimplicit-function-declaration"]
+            set args [list "/usr/bin/grep" "-E" "--" "-Wimplicit-function-declaration\\\]\$"]
             lappend args [file join ${workpath} $file]
 
             if {![catch {set result [exec -- {*}$args]}]} {
@@ -1947,7 +1993,7 @@ proc portconfigure::check_implicit_function_declarations {} {
     }
 
     if {[dict size $undeclared_functions] > 0} {
-        ui_warn "Configuration logfiles contain indications of -Wimplicit-function-declaration; check that features were not accidentally disabled:"
+        ui_warn [format [msgcat::mc "Configuration logfiles contain indications of %s; check that features were not accidentally disabled:"] "-Wimplicit-function-declaration"]
         dict for {function files} $undeclared_functions {
             ui_msg [format "  %s: found in %s" $function [join [dict keys $files] ", "]]
         }
@@ -1972,9 +2018,19 @@ proc portconfigure::load_implicit_function_declaration_whitelist {sdk_version} {
 proc portconfigure::configure_finish {args} {
     global \
         configure.dir \
-        configure.checks.implicit_function_declaration
+        configure.checks.implicit_function_declaration \
+        configure.checks.implicit_int \
+        configure.checks.incompatible_function_pointer_types
 
-    if {[file isdirectory ${configure.dir}] && ${configure.checks.implicit_function_declaration}} {
-        portconfigure::check_implicit_function_declarations
+    if {[file isdirectory ${configure.dir}]} {
+        if {${configure.checks.implicit_function_declaration}} {
+            portconfigure::check_implicit_function_declarations
+        }
+        if {${configure.checks.implicit_int}} {
+            portconfigure::check_implicit_int
+        }
+        if {${configure.checks.incompatible_function_pointer_types}} {
+            portconfigure::check_incompatible_function_pointer_types
+        }
     }
 }

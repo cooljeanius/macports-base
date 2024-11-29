@@ -41,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/select.h>
 #include <utime.h>
 
@@ -82,6 +83,9 @@ static CURLM* theMHandle = NULL;
  * take advantage of HTTP pipelining, especially to the packages servers. */
 static CURL* theHandle = NULL;
 
+/* Global libcurl version info. */
+static curl_version_info_data *libcurl_version_info = NULL;
+
 /* ------------------------------------------------------------------------- **
  * Prototypes
  * ------------------------------------------------------------------------- */
@@ -91,6 +95,7 @@ int CurlFetchCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[]);
 int CurlIsNewerCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[]);
 int CurlGetSizeCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[]);
 int CurlPostCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[]);
+int CurlVersionCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[]);
 
 typedef struct {
 	Tcl_Interp *interp;
@@ -102,6 +107,7 @@ static int CurlProgressHandler(tcl_callback_t *callback, double dltotal, double 
 static void CurlProgressCleanup(tcl_callback_t *callback);
 
 void CurlInit(void);
+static void set_curl_version_info(void);
 
 /* ========================================================================= **
  * Entry points
@@ -152,6 +158,62 @@ SetResultFromCurlMErrorCode(Tcl_Interp *interp, CURLMcode inErrorCode)
 
 	return result;
 }
+
+/* Bug affecting some versions of Monterey through Sequoia:
+   reusing an easy handle for different protocols can cause a
+   crash. https://github.com/curl/curl/issues/13731
+   TODO: Add upper bound here when we know what version macOS 16 ships. */
+#if LIBCURL_VERSION_NUM >= 0x074d00
+static void cleanup_handle_if_needed(const char *theURL);
+
+static void cleanup_handle_if_needed(const char *theURL)
+{
+    static CURLU *currentURLHandle = NULL;
+    static CURLU *previousURLHandle = NULL;
+
+    set_curl_version_info();
+    if (libcurl_version_info == NULL) {
+        fprintf(stderr, "Warning: set_curl_version_info failed\n");
+        return;
+    }
+
+    if (libcurl_version_info->version_num >= 0x080600 && libcurl_version_info->version_num < 0x080800) {
+        if (previousURLHandle != NULL) {
+            curl_url_cleanup(previousURLHandle);
+        }
+        previousURLHandle = currentURLHandle;
+        currentURLHandle = curl_url();
+         if (currentURLHandle != NULL
+            && curl_url_set(currentURLHandle, CURLUPART_URL, theURL, 0) != CURLUE_OK) {
+            curl_url_cleanup(currentURLHandle);
+            currentURLHandle = NULL;
+        }
+        if (theMHandle != NULL && currentURLHandle != NULL && previousURLHandle != NULL) {
+            char *current_scheme = NULL;
+            char *previous_scheme = NULL;
+            char *current_host = NULL;
+            char *previous_host = NULL;
+            int must_recreate_handle = 0;
+            if (curl_url_get(previousURLHandle, CURLUPART_SCHEME, &previous_scheme, 0) == CURLUE_OK
+                && curl_url_get(currentURLHandle, CURLUPART_SCHEME, &current_scheme, 0) == CURLUE_OK
+                && 0 != strcasecmp(previous_scheme, current_scheme)) {
+                must_recreate_handle = 1;
+            }
+            if (!must_recreate_handle
+                && curl_url_get(previousURLHandle, CURLUPART_HOST, &previous_host, 0) == CURLUE_OK
+                && curl_url_get(currentURLHandle, CURLUPART_HOST, &current_host, 0) == CURLUE_OK
+                && 0 != strcasecmp(previous_host, current_host)) {
+                must_recreate_handle = 1;
+            }
+            if (must_recreate_handle) {
+                /* deallocate the handle and start again */
+                curl_multi_cleanup(theMHandle);
+                theMHandle = NULL;
+            }
+        }
+    }
+}
+#endif /* LIBCURL_VERSION_NUM >= 0x074d00 */
 
 /**
  * curl fetch subcommand entry point.
@@ -327,6 +389,10 @@ CurlFetchCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 			theResult = TCL_ERROR;
 			break;
 		}
+
+#if LIBCURL_VERSION_NUM >= 0x074d00
+		cleanup_handle_if_needed(theURL);
+#endif
 
 		/* Create the CURL handles */
 		if (theMHandle == NULL) {
@@ -648,7 +714,7 @@ CurlFetchCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 			theResult = TCL_ERROR;
 			break;
 		}
-		
+
 		if (info->data.result != CURLE_OK) {
 			/* execution failed, use the error string if it is set */
 			if (theErrorString[0] != '\0') {
@@ -770,6 +836,7 @@ CurlIsNewerCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 		CURLcode theCurlCode;
 		long theModDate;
 		long userModDate;
+		const char* userAgent = PACKAGE_NAME "/" PACKAGE_VERSION " libcurl/" LIBCURL_VERSION;
 
 		optioncrsr = 2;
 		lastoption = objc - 3;
@@ -835,6 +902,13 @@ CurlIsNewerCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 
 		/* -L option */
 		theCurlCode = curl_easy_setopt(theHandle, CURLOPT_FOLLOWLOCATION, 1);
+		if (theCurlCode != CURLE_OK) {
+			theResult = SetResultFromCurlErrorCode(interp, theCurlCode);
+			break;
+		}
+
+		/* -A option */
+		theCurlCode = curl_easy_setopt(theHandle, CURLOPT_USERAGENT, userAgent);
 		if (theCurlCode != CURLE_OK) {
 			theResult = SetResultFromCurlErrorCode(interp, theCurlCode);
 			break;
@@ -1435,6 +1509,75 @@ CurlPostCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 	return theResult;
 }
 
+/* Fill in global libcurl_version_info structure */
+static void set_curl_version_info(void)
+{
+    if (libcurl_version_info == NULL) {
+        libcurl_version_info = curl_version_info(CURLVERSION_NOW);
+    }
+}
+
+/**
+ * curl version subcommand entry point.
+ *
+ * @param interp		current interpreter
+ * @param objc			number of parameters
+ * @param objv			parameters
+ */
+int
+CurlVersionCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
+{
+	int theResult = TCL_OK;
+	Tcl_Obj *tcl_result = NULL;
+	curl_version_info_data *theVersionInfo;
+
+    set_curl_version_info();
+    if (libcurl_version_info == NULL) {
+        return TCL_ERROR;
+    }
+    theVersionInfo = libcurl_version_info;
+
+	tcl_result = Tcl_NewDictObj();
+
+	// info from the curl version we were built against:
+	Tcl_DictObjPut(interp, tcl_result, Tcl_NewStringObj("VERSION_NOW-build", -1), Tcl_NewIntObj(CURLVERSION_NOW));
+	Tcl_DictObjPut(interp, tcl_result, Tcl_NewStringObj("VERSION-build", -1), Tcl_NewStringObj(LIBCURL_VERSION, -1));
+	// runtime info from the libcurl we are actually using:
+	Tcl_DictObjPut(interp, tcl_result, Tcl_NewStringObj("VERSION-runtime", -1), Tcl_NewStringObj(theVersionInfo->version, -1));
+	Tcl_DictObjPut(interp, tcl_result, Tcl_NewStringObj("HOST", -1), Tcl_NewStringObj(theVersionInfo->host, -1));
+	Tcl_DictObjPut(interp, tcl_result, Tcl_NewStringObj("SSL_BACKEND", -1), Tcl_NewStringObj(theVersionInfo->ssl_version, -1));
+	Tcl_Obj *tcl_prots = Tcl_NewListObj(0, NULL);
+	const char * const *prot = theVersionInfo->protocols;
+	while (*prot) {
+		Tcl_ListObjAppendElement(interp, tcl_prots, Tcl_NewStringObj(*prot, -1));
+		prot++;
+	}
+	Tcl_DictObjPut(interp, tcl_result, Tcl_NewStringObj("PROTOCOLS", -1), tcl_prots);
+// returning feature names requires a build-time and a runtime check:
+#if LIBCURL_VERSION_NUM >= 0x078700
+	if (theVersionInfo->age >= CURLVERSION_ELEVENTH && theVersionInfo->feature_names) {
+		Tcl_Obj *tcl_feats = Tcl_NewListObj(0, NULL);
+		const char * const *feats = theVersionInfo->feature_names;
+		while (*feats) {
+			Tcl_ListObjAppendElement(interp, tcl_feats, Tcl_NewStringObj(*feats, -1));
+			feats++;
+		}
+		Tcl_DictObjPut(interp, tcl_result, Tcl_NewStringObj("FEATURES", -1), tcl_feats);
+	} else
+#endif
+	{
+		// it would be possible to generate a list of feature names from the feature mask
+		// but tedious because it would involve checking for the existence of many of the 
+		// feature tokens; probably not justified for the intended use of the `curl version`
+		// command (primarily debugging).
+		Tcl_DictObjPut(interp, tcl_result, Tcl_NewStringObj("FEATURE_MASK", -1), Tcl_NewIntObj(theVersionInfo->features));
+	}
+
+	Tcl_SetObjResult(interp, tcl_result);
+
+	return theResult;
+}
+
 /**
  * curl command entry point.
  *
@@ -1454,11 +1597,12 @@ CurlCmd(
 		kCurlFetch,
 		kCurlIsNewer,
 		kCurlGetSize,
-		kCurlPost
+		kCurlPost,
+		kCurlVersion
 	} EOption;
 
 	static const char *options[] = {
-		"fetch", "isnewer", "getsize", "post", NULL
+		"fetch", "isnewer", "getsize", "post", "version", NULL
 	};
 	int theResult = TCL_OK;
 	EOption theOptionIndex;
@@ -1467,18 +1611,18 @@ CurlCmd(
 	/* TODO: use dispatch_once when we drop Leopard support */
 	pthread_once(&once, CurlInit);
 
-	if (objc < 3) {
-		Tcl_WrongNumArgs(interp, 1, objv, "option ?arg ...?");
-		return TCL_ERROR;
-	}
-
-	theResult = Tcl_GetIndexFromObj(
+	theResult = objc > 1 ? Tcl_GetIndexFromObj(
 				interp,
 				objv[1],
 				options,
 				"option",
 				0,
-				(int*) &theOptionIndex);
+				(int*) &theOptionIndex) : TCL_ERROR;
+	if (theResult != TCL_OK || (objc < 3 && theOptionIndex != kCurlVersion)) {
+		Tcl_WrongNumArgs(interp, 1, objv, "option ?arg ...?");
+		return TCL_ERROR;
+	}
+
 	if (theResult == TCL_OK) {
 		switch (theOptionIndex) {
 		case kCurlFetch:
@@ -1492,6 +1636,9 @@ CurlCmd(
 			break;
 		case kCurlPost:
 			theResult = CurlPostCmd(interp, objc, objv);
+			break;
+		case kCurlVersion:
+			theResult = CurlVersionCmd(interp, objc, objv);
 			break;
 		}
 	}

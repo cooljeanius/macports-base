@@ -179,9 +179,14 @@ proc portlist_sortint {portlist} {
 }
 
 proc portlist_compareregrefs {a b} {
-    set byname [string compare -nocase [$a name] [$b name]]
-    if {$byname != 0} {
-        return $byname
+    set aname [$a name]
+    set bname [$b name]
+    if {![string equal -nocase $aname $bname]} {
+        # There's no -dictionary option for string compare as of Tcl 8.6
+        if {$aname eq [lindex [lsort -dictionary [list $aname $bname]] 0]} {
+            return -1
+        }
+        return 1
     }
     set byvers [vercmp [$a version] [$b version]]
     if {$byvers != 0} {
@@ -275,6 +280,7 @@ proc portlist::opComplement {a b} {
     # Top level keys are normalised port names.
     # Second level is a dict mapping fully discriminated names (to empty
     # strings since we don't need the full entries from b.)
+    set bdict [dict create]
     foreach bitem $b {
         dict set bdict [string tolower [dict get $bitem name]] [dict get $bitem fullname] ""
     }

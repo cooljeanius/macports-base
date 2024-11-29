@@ -120,12 +120,14 @@ namespace eval restore {
 
         array set diff [snapshot::diff $snapshot]
 
-        foreach field {added removed changed} {
-            set result {}
-            foreach port $diff($field) {
-                lassign $port _ requested
-                if {$requested} {
-                    lappend result $port
+        if {!$include_unrequested} {
+            foreach field {added removed changed} {
+                set result {}
+                foreach port $diff($field) {
+                    lassign $port _ requested
+                    if {$requested} {
+                        lappend result $port
+                    }
                 }
                 set diff($field) $result
             }
@@ -156,19 +158,58 @@ namespace eval restore {
                     lassign [dict get $failed $name] type reason
                     switch $type {
                         skipped {
-                            append note "   Skipped becuase its $reason\n"
+                            append note "   Skipped because its $reason\n"
                         }
                         failed {
-                            append note "   Failed to build: $reason\n"
+                            append note "   Failed: $reason\n"
                         }
                     }
                 }
             }
         }
 
-        if {[llength $diff(changed)] > 0} {
+        # It's possible that a port's state changed because it failed
+        # to activate, or it's a platform-independent port that stayed
+        # installed but a dependency failed. Report that separately.
+        set changed_and_failed {}
+        set just_changed {}
+        foreach changed_port $diff(changed) {
+            set name [lindex $changed_port 0]
+            if {[dict exists $failed $name]} {
+                lappend changed_and_failed $changed_port
+            } else {
+                lappend just_changed $changed_port
+            }
+        }
+
+        if {[llength $changed_and_failed] > 0} {
+            append note "The following ports could not be fully restored:\n"
+            foreach changed_port [lsort -ascii -index 0 $changed_and_failed] {
+                lassign $changed_port name _ _ _ requested_variants changes
+                if {$requested_variants ne ""} {
+                    append note " - $name\n"
+                } else {
+                    append note " - $name $requested_variants\n"
+                }
+                lassign [dict get $failed $name] type reason
+                switch $type {
+                    skipped {
+                        append note "   Skipped because its $reason\n"
+                    }
+                    failed {
+                        append note "   Failed: $reason\n"
+                    }
+                }
+                foreach change $changes {
+                    lassign $change field old new
+                    append note "   $field changed from '$old' to '$new'\n"
+                }
+            }
+        }
+
+        if {[llength $just_changed] > 0} {
             append note "The following ports were restored with changes:\n"
-            foreach changed_port [lsort -ascii -index 0 $diff(changed)] {
+            foreach changed_port [lsort -ascii -index 0 $just_changed] {
                 lassign $changed_port name _ _ _ requested_variants changes
                 if {$requested_variants ne ""} {
                     append note " - $name\n"
@@ -453,7 +494,7 @@ namespace eval restore {
                 set variations [variants_to_variations_arr $requested_variants]
                 if {[catch {set mport [mportopen $porturl $options $variations]} result]} {
                     $progress intermission
-                    ui_error "Unable to open port '$portname' with variants '$variants': $result"
+                    ui_error "Unable to open port '$portname' with variants '$requested_variants': $result"
                     continue
                 }
                 dict set mports $portname $mport
@@ -606,7 +647,9 @@ namespace eval restore {
             -command [lambda {level mode dependencies node} {
                 if {$mode eq "enter"} {
                     uplevel $level [subst -nocommands {
-                        dict set failed $node [list "skipped" "dependency \$portname failed"]
+                        if {![dict exists \$failed $node]} {
+                            dict set failed $node [list "skipped" "dependency \$portname failed"]
+                        }
                     }]
                 }
             } $level]
@@ -684,9 +727,9 @@ namespace eval restore {
             foreach target [list clean $install_target] {
                 if {[catch {set result [mportexec $mport $target]} result]} {
                     ui_msg $::errorInfo
-                    _handle_failure failed $dependencies $name "Unable to execute target $target for port $name: $result"
+                    _handle_failure failed $dependencies $name "Unable to execute target '$target' for port $name: $result"
                 } elseif {$result != 0} {
-                    _handle_failure failed $dependencies $name "Failed to $target $name"
+                    _handle_failure failed $dependencies $name "Unable to execute target '$target' for port $name - see its log for details"
                 }
             }
             mportclose $mport
