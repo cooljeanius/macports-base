@@ -550,16 +550,16 @@ proc portconfigure::find_close_sdk {sdk_version sdk_path} {
 
 proc portconfigure::configure_get_sdkroot {sdk_version} {
     global developer_dir macos_version macos_version_major xcodeversion \
-           os.arch os.major os.platform use_xcode
+           os.arch os.major os.platform use_xcode system_options
+
+    # Explicit override value
+    if {[info exists system_options(macosx_sdk_path)]} {
+        return $system_options(macosx_sdk_path)
+    }
 
     # This is only relevant for macOS
     if {${os.platform} ne "darwin"} {
         return {}
-    }
-
-    # Special hack for Tiger/ppc, since the system libraries do not contain intel slices
-    if {${os.arch} eq "powerpc" && $macos_version_major eq "10.4" && [variant_exists universal] && [variant_isset universal]} {
-        return ${developer_dir}/SDKs/MacOSX10.4u.sdk
     }
 
     # Use the DevSDK (eg: /usr/include) if present and the requested SDK version matches the host version
@@ -798,7 +798,25 @@ proc portconfigure::configure_get_default_compiler {} {
     foreach compiler $search_list {
         set allowed yes
         foreach pattern ${compiler.blacklist} {
-            if {[string match $pattern $compiler]} {
+            if {[llength $pattern] >= 3 && [lindex $pattern 0] eq $compiler} {
+                # version based, e.g. {clang < 500}
+                set compiler_vers [compiler.command_line_tools_version $compiler]
+                set allowed no
+                if {$compiler_vers eq {}} {
+                    break
+                }
+                foreach {operator check_vers} [lrange ${pattern} 1 end] {
+                    # matches only if all comparisons are true
+                    if {![vercmp $compiler_vers $operator $check_vers]} {
+                        set allowed yes
+                        break
+                    }
+                }
+                if {!$allowed} {
+                    break
+                }
+            } elseif {[string match $pattern $compiler]} {
+                # pattern based, e.g. *gcc-4.2
                 set allowed no
                 break
             }
@@ -1249,7 +1267,7 @@ proc portconfigure::get_clang_compilers {} {
                 }
             }
 
-            if {${os.major} >= 9 && ${os.major} < 20} {
+            if {${os.major} < 20} {
                 lappend compilers macports-clang-7.0 \
                     macports-clang-6.0 \
                     macports-clang-5.0
@@ -1257,13 +1275,8 @@ proc portconfigure::get_clang_compilers {} {
 
             if {${os.major} < 16} {
                 # The Sierra SDK requires a toolchain that supports class properties
-                if {${os.major} >= 9} {
-                    lappend compilers macports-clang-3.7
-                }
-                lappend compilers macports-clang-3.4
-                if {${os.major} < 9} {
-                    lappend compilers macports-clang-3.3
-                }
+                lappend compilers macports-clang-3.7 \
+                        compilers macports-clang-3.4
             }
 
         }
@@ -1857,7 +1870,7 @@ proc portconfigure::configure_main {args} {
             append_to_environment_value configure "__CFPREFERENCES_AVOID_DAEMON" 1
         }
 
-        # add SDK flags if cross-compiling (or universal on ppc tiger)
+        # add SDK flags if needed
         if {${configure.sdkroot} ne "" && !${compiler.limit_flags}} {
             foreach env_var {CPPFLAGS CFLAGS CXXFLAGS OBJCFLAGS OBJCXXFLAGS} {
                 append_to_environment_value configure $env_var -isysroot${configure.sdkroot}

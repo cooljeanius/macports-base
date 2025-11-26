@@ -31,6 +31,7 @@
 
 package provide portfetch 1.0
 package require fetch_common 1.0
+package require portextract 1.0
 package require portutil 1.0
 package require Pextlib 1.0
 
@@ -45,8 +46,8 @@ namespace eval portfetch {
 }
 
 # define options: distname master_sites
-options master_sites patch_sites extract.suffix distfiles patchfiles use_tar \
-    use_bzip2 use_lzma use_xz use_zip use_7z use_lzip use_dmg dist_subdir \
+options master_sites patch_sites distfiles patchfiles \
+    dist_subdir \
     fetch.type fetch.user fetch.password fetch.use_epsv fetch.ignore_sslcert \
     fetch.user_agent master_sites.mirror_subdir patch_sites.mirror_subdir \
     bzr.url bzr.revision \
@@ -62,7 +63,6 @@ commands cvs
 commands svn
 
 # Defaults
-default extract.suffix .tar.gz
 default fetch.type standard
 
 default bzr.cmd {[findBinary bzr $portutil::autoconf::bzr_path]}
@@ -121,56 +121,8 @@ default mirror_sites.listfile mirror_sites.tcl
 default mirror_sites.listpath port1.0/fetch
 
 # Option-executed procedures
-option_proc use_tar   portfetch::set_extract_type
-option_proc use_bzip2 portfetch::set_extract_type
-option_proc use_lzma  portfetch::set_extract_type
-option_proc use_xz    portfetch::set_extract_type
-option_proc use_zip   portfetch::set_extract_type
-option_proc use_7z    portfetch::set_extract_type
-option_proc use_lzip  portfetch::set_extract_type
-option_proc use_dmg   portfetch::set_extract_type
 
 option_proc fetch.type portfetch::set_fetch_type
-
-proc portfetch::set_extract_type {option action args} {
-    global extract.suffix
-    if {[string equal ${action} "set"] && [tbool args]} {
-        switch $option {
-            use_tar {
-                set extract.suffix .tar
-            }
-            use_bzip2 {
-                set extract.suffix .tar.bz2
-                if {![catch {findBinary lbzip2} result]} {
-                    depends_extract-append bin:lbzip2:lbzip2
-                }
-            }
-            use_lzma {
-                set extract.suffix .tar.lzma
-                depends_extract-append bin:lzma:xz
-            }
-            use_xz {
-                set extract.suffix .tar.xz
-                depends_extract-append bin:xz:xz
-            }
-            use_zip {
-                set extract.suffix .zip
-                depends_extract-append bin:unzip:unzip
-            }
-            use_7z {
-                set extract.suffix .7z
-                depends_extract-append bin:7za:p7zip
-            }
-            use_lzip {
-                set extract.suffix .tar.lz
-                depends_extract-append bin:lzip:lzip
-            }
-            use_dmg {
-                set extract.suffix .dmg
-            }
-        }
-    }
-}
 
 proc portfetch::set_fetch_type {option action args} {
     global os.platform os.major
@@ -302,16 +254,13 @@ proc portfetch::bzrfetch {args} {
     #   "proxy.example.com:8080": No host component
     # Set the "http_proxy" and "HTTPS_PROXY" environmental variables
     # to valid URLs by prepending "http://" and appending "/".
-    if {   [info exists env(http_proxy)]
-        && [string compare -length 7 {http://} $env(http_proxy)] != 0} {
-        set orig_http_proxy $env(http_proxy)
-        set env(http_proxy) http://${orig_http_proxy}/
-    }
-
-    if {   [info exists env(HTTPS_PROXY)]
-        && [string compare -length 7 {http://} $env(HTTPS_PROXY)] != 0} {
-        set orig_https_proxy $env(HTTPS_PROXY)
-        set env(HTTPS_PROXY) http://${orig_https_proxy}/
+    foreach varname {http_proxy https_proxy HTTPS_PROXY} {
+        if {[info exists env($varname)]
+            && [string compare -length 7 {http://} $env($varname)] != 0
+        } then {
+            set orig_${varname} $env($varname)
+            set env($varname) http://[set orig_${varname}]/
+        }
     }
 
     try {
@@ -319,11 +268,10 @@ proc portfetch::bzrfetch {args} {
             return -code error [msgcat::mc "Bazaar checkout failed"]
         }
     } finally {
-        if {[info exists orig_http_proxy]} {
-            set env(http_proxy) ${orig_http_proxy}
-        }
-        if {[info exists orig_https_proxy]} {
-            set env(HTTPS_PROXY) ${orig_https_proxy}
+        foreach varname {http_proxy https_proxy HTTPS_PROXY} {
+            if {[info exists orig_${varname}]} {
+                set env($varname) [set orig_${varname}]
+            }
         }
     }
 
@@ -392,8 +340,8 @@ proc portfetch::svn_proxy_args {url} {
         && [info exists env(http_proxy)]} {
         set proxy_str $env(http_proxy)
     } elseif {   [string compare -length 8 {https://} ${url}] == 0
-              && [info exists env(HTTPS_PROXY)]} {
-        set proxy_str $env(HTTPS_PROXY)
+              && ([info exists env(HTTPS_PROXY)] || [info exists env(https_proxy)])} {
+        set proxy_str [expr {[info exists env(https_proxy)] ? $env(https_proxy) : $env(HTTPS_PROXY)}]
     } else {
         return ""
     }
@@ -407,7 +355,8 @@ proc portfetch::svn_proxy_args {url} {
 
 # Perform an svn fetch
 proc portfetch::svnfetch {args} {
-    global svn.args svn.method svn.revision svn.url patchfiles
+    global svn.args svn.method svn.revision svn.url patchfiles \
+        fetch.user fetch.password
 
     if {[regexp {\s} ${svn.url}]} {
         return -code error [msgcat::mc "Subversion URL cannot contain whitespace"]
@@ -419,6 +368,12 @@ proc portfetch::svnfetch {args} {
 
     if {[option fetch.ignore_sslcert]} {
         svn.pre_args-append --trust-server-cert
+    }
+    if {${fetch.user} ne {}} {
+        svn.pre_args-append --username ${fetch.user}
+    }
+    if {${fetch.password} ne {}} {
+        svn.pre_args-append --password ${fetch.password}
     }
 
     set proxy_args [svn_proxy_args ${svn.url}]
@@ -501,9 +456,9 @@ proc portfetch::fetchfiles {args} {
     variable urlmap
 
     set fetch_options [list]
+    set credentials {}
     if {[string length ${fetch.user}] || [string length ${fetch.password}]} {
-        lappend fetch_options -u
-        lappend fetch_options "${fetch.user}:${fetch.password}"
+        set credentials ${fetch.user}:${fetch.password}
     }
     if {${fetch.use_epsv} ne "yes"} {
         lappend fetch_options "--disable-epsv"
@@ -547,7 +502,7 @@ proc portfetch::fetchfiles {args} {
                 ui_notice "$UI_PREFIX [format [msgcat::mc "Attempting to fetch %s from %s"] $distfile $site]"
                 set file_url [portfetch::assemble_url $site $distfile]
                 macports_try -pass_signal {
-                    curl fetch {*}$fetch_options $file_url "${distpath}/${distfile}.TMP"
+                    curlwrap fetch $site $credentials {*}$fetch_options $file_url ${distpath}/${distfile}.TMP
                     file rename -force "${distpath}/${distfile}.TMP" "${distpath}/${distfile}"
                     set fetched 1
                     break

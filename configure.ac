@@ -28,11 +28,10 @@ if test "x$SW_VERS" != "x"; then
 fi
 
 case "$MACOSX_VERSION" in
-  10.0|10.0.*|10.1|10.1.*|10.2|10.2.*|10.3|10.3.*)
-    AC_MSG_ERROR([This version of Mac OS X is not supported
-                  Please upgrade at http://store.apple.com/])
+  10.[[0-4]]|10.[[0-4]].*)
+    AC_MSG_ERROR([MacPorts requires Mac OS X 10.5 or later.])
     ;;
-  10.4|10.4.[[1-9]]|10.4.10|10.5|10.5.[[1-7]]|10.6|10.6.[[1-7]]|10.7|10.7.[[1-4]])
+  10.5|10.5.[[1-7]]|10.6|10.6.[[1-7]]|10.7|10.7.[[1-4]])
     AC_MSG_WARN([This version of Mac OS X is out of date])
     AC_MSG_WARN([Please run Software Update to update it])
     ;;
@@ -107,6 +106,11 @@ AC_PROG_GREP
 AC_PROG_INSTALL
 AC_PROG_LN_S
 AC_PROG_MAKE_SET
+
+# Save this for use at runtime. We may use a different install program
+# to install our own files.
+SYSTEM_INSTALL="$INSTALL"
+AC_SUBST(SYSTEM_INSTALL)
 
 # Check for user-supplied paths before searching
 
@@ -218,6 +222,7 @@ MP_PATH_MPCONFIGDIR
 
 # Check whether to install without root privileges
 MP_CHECK_NOROOTPRIVILEGES
+AC_SUBST(NO_ROOTPRIVS)
 
 # Check for install ownership
 MP_CHECK_INSTALLUSER
@@ -259,7 +264,7 @@ AC_SUBST(HAVE_DECL_RPP_STDIN, $ac_cv_have_decl_RPP_STDIN)
 # Checks for library functions.
 AC_CHECK_FUNCS([OSAtomicCompareAndSwap32 OSAtomicCompareAndSwap64 \
 	OSAtomicCompareAndSwapPtr __getdirentries64 arc4random_buf clearenv \
-	clonefile copyfile _dyld_shared_cache_contains_path flock fls \
+	clonefile copyfile _dyld_shared_cache_contains_path flock \
 	getentropy kqueue posix_spawn setmode sysctlbyname timingsafe_bcmp])
 
 # For vendor/signify
@@ -273,6 +278,8 @@ AC_SUBST(HAVE_CLONEFILE, $ac_cv_func_clonefile)
 AC_SUBST(HAVE_DECL_CLONE_NOOWNERCOPY, $ac_cv_have_decl_CLONE_NOOWNERCOPY)
 if test x$ac_cv_func_clonefile = xyes -a x$ac_cv_have_decl_CLONE_NOOWNERCOPY = xyes; then
 AC_CONFIG_FILES([vendor/install/Makefile])
+# If we build it, also use to install our own files.
+INSTALL="`(cd vendor; pwd)`/install/build/install"
 fi
 
 # Check for library functions, replacements are in pextlib1.0/compat/
@@ -384,6 +391,18 @@ VENDOR_TCLX_INSTALL="install-binaries install-libraries"
 AC_SUBST(VENDOR_TCLX_SUBDIR)
 AC_SUBST(VENDOR_TCLX_INSTALL)
 
+## critcl package
+CRITCL_PLATFORMS="$(echo "$CFLAGS" | awk '{for (I=1;I<NF;I++) if ($I == "-arch") print "macosx-"$(I+1)}')"
+if test "$CRITCL_PLATFORMS" = "" -a "$OS_PLATFORM" = darwin; then
+    CRITCL_PLATFORMS=macosx-$host_cpu
+fi
+CRITCL_PLATFORMS="$(echo "$CRITCL_PLATFORMS" | \
+    sed -E -e 's/macosx-a(rm|arch)64/macosx-aarch64 macosx-arm macosx-arm64/' \
+        -e 's/macosx-i[3-6]86/macosx-ix86/' \
+        -e 's/macosx-ppc/macosx-powerpc/' \
+        | tr '\n' ' ')"
+AC_SUBST(CRITCL_PLATFORMS)
+
 ## Tcllib package
 # Note that Tcllib needs a Tcl interpreter during installation; it will *not*
 # be the one we configure above, because that one isn't built yet. That's not
@@ -449,8 +468,8 @@ AC_CONFIG_FILES([
 	portmgr/dmg/postflight
 	setupenv.bash
 	src/Makefile
-	src/cregistry/Makefile
 	src/compat/Makefile
+	src/cregistry/Makefile
 	src/darwintracelib1.0/Makefile
 	src/darwintracelib1.0/tests/Makefile
 	src/machista1.0/Makefile
@@ -461,11 +480,12 @@ AC_CONFIG_FILES([
 	src/package1.0/Makefile
 	src/package1.0/package_test_autoconf.tcl
 	src/pextlib1.0/Makefile
-	src/portlist1.0/Makefile
 	src/port/Makefile
+	src/port/port-tclsh.c
 	src/port1.0/Makefile
 	src/port1.0/port_autoconf.tcl
 	src/port1.0/port_test_autoconf.tcl
+	src/portlist1.0/Makefile
 	src/programs/Makefile
 	src/registry2.0/Makefile
 	src/registry2.0/registry_autoconf.tcl
@@ -474,6 +494,7 @@ AC_CONFIG_FILES([
 	tests/test/library.tcl
 	tests/test/trace/test.tcl
 	vendor/Makefile
+	vendor/critcl/lib/critcl/Config
 	vendor/signify-osx/autoconf.mk
 ])
 

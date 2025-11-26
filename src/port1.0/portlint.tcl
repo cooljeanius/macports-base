@@ -260,7 +260,7 @@ proc portlint::lint_platforms {platforms} {
     set errors [list]
     set warnings [list]
 
-    global lint_platforms
+    global lint_platforms name subport PortInfo
 
     foreach platform $platforms {
         set platname [lindex $platform 0]
@@ -269,7 +269,11 @@ proc portlint::lint_platforms {platforms} {
         }
     }
 
-    if {$platforms eq "darwin"} {
+    # Skip if there are any subports in the Portfile, as lint is not smart
+    # enough to know which platforms line belongs to which subport.
+    if {$platforms eq "darwin" && [string equal -nocase $name $subport]
+        && (![info exists PortInfo(subports)] || $PortInfo(subports) eq {})
+    } then {
         lappend warnings "Unnecessary platforms line as darwin is the default"
     }
 
@@ -465,11 +469,6 @@ proc portlint::lint_main {args} {
         if {[regexp {^\s*configure\s+\{\s*\}} $line]} {
             ui_warn "Line $lineno should say \"use_configure no\" instead of declaring an empty configure phase"
             incr warnings
-        }
-
-        if {[regexp {^\s*compiler\.blacklist(?:-[a-z]+)?\s.*(["{]\S+(?:\s+\S+){2,}["}])} $line -> blacklist] && ![dict exists $portgroups compiler_blacklist_versions]} {
-            ui_error "Line $lineno uses compiler.blacklist entry $blacklist which requires the compiler_blacklist_versions portgroup which has not been included"
-            incr errors
         }
 
         if {[regexp {(^.*)(\meval\s+)(.*)(\[glob\M)(.*$)} $line -> match_before match_eval match_between match_glob match_after]} {
@@ -882,9 +881,11 @@ proc portlint::lint_main {args} {
 
     if {$nitpick && [info exists patchfiles]} {
         foreach patchfile $patchfiles {
-            if {!([string match "*.diff" $patchfile] ||
-                  [string match "*.patch" $patchfile]) &&
-                 [file exists "$portpath/files/$patchfile"]} {
+            set ext [file extension $patchfile]
+            if {$ext in {.Z .gz .bz2 .xz}} {
+                set ext [file extension [file rootname $patchfile]]
+            }
+            if {$ext ni {.diff .patch} && [file exists ${portpath}/files/${patchfile}]} {
                 ui_warn "Patchfile $patchfile does not follow the source patch naming policy \"*.diff\" or \"*.patch\""
                 incr warnings
             }

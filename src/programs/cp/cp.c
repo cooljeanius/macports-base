@@ -2,14 +2,15 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
+#include <string.h>
 #include <sys/errno.h>
+#include <unistd.h>
 
 int main(int argc, char *argv[])
 {
-    const char *cp_path = "/bin/cp";
-    const char *clone_arg = "-c";
-    const char **new_argv = malloc(sizeof(char *) * (argc+2));
+    char cp_path[] = "/bin/cp";
+    char clone_arg[] = "-c";
+    char **new_argv = malloc(sizeof(char *) * (argc+2));
     if (new_argv) {
         new_argv[0] = cp_path;
         new_argv[1] = clone_arg;

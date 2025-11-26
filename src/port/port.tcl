@@ -146,7 +146,17 @@ proc map_friendly_field_names { field } {
 }
 
 
-proc registry_installed {portname {portversion ""} {require_single yes} {only_active no}} {
+# Return registry handles for the installed port(s) that have the given
+# name and (optionally) version.
+# allow_multiple: possible values are "no", "all", or "selected"
+#   no: Return one value. Error if more than one port matches and
+#       interactive disambiguation is not possible.
+#   all: Return a list of all matches.
+#   selected: Return a single match, or if more than one port matches,
+#       return the values chosen by the user if interactive, otherwise
+#       error.
+# only_active: boolean, whether to match only active ports
+proc registry_installed {portname {portversion ""} {allow_multiple no} {only_active no}} {
     if {!$only_active} {
         set possible_matches [registry::entry imaged $portname]
     } else {
@@ -164,7 +174,7 @@ proc registry_installed {portname {portversion ""} {require_single yes} {only_ac
         set matches $possible_matches
     }
 
-    if {!$require_single} {
+    if {$allow_multiple eq "all" || ($matches eq {} && $allow_multiple eq "selected")} {
         return $matches
     }
 
@@ -181,9 +191,16 @@ proc registry_installed {portname {portversion ""} {require_single yes} {only_ac
                 lappend portilist "  $portname @[$i version]_[$i revision][$i variants]"
             }
         }
-        if {[info exists ui_options(questions_singlechoice)]} {
-            set retindex [$macports::ui_options(questions_singlechoice) $msg "Choice_Q1" $portilist]
+        if {$allow_multiple eq "no" && [info exists ui_options(questions_singlechoice)]} {
+            set retindex [$ui_options(questions_singlechoice) $msg "Choice_Q1" $portilist]
             return [lindex $matches $retindex]
+        } elseif {$allow_multiple eq "selected" && [info exists ui_options(questions_multichoice)]} {
+            set indexlist [$ui_options(questions_multichoice) $msg "Choice_Q2" $portilist]
+            set retlist [list]
+            foreach index $indexlist {
+                lappend retlist [lindex $matches $index]
+            }
+            return $retlist
         } else {
             ui_notice $msg
             foreach portstr $portilist {
@@ -198,7 +215,11 @@ proc registry_installed {portname {portversion ""} {require_single yes} {only_ac
             return -code error "Registry error: $portname $portversion not registered as installed."
         }
     }
-    return [lindex $matches 0]
+    if {$allow_multiple eq "no"} {
+        return [lindex $matches 0]
+    } else {
+        return $matches
+    }
 }
 
 # Add the entry to the given portlist, adding default values for name,
@@ -813,7 +834,7 @@ proc get_dep_ports {portname recursive} {
             return -code error "Unable to open port $portname: $result"
         }
     }
-    set portinfo [dict merge $portinfo [mportinfo $mport]]
+    set portinfo [mportinfo $mport]
     mportclose $mport
 
     # gather its deps
@@ -858,7 +879,7 @@ proc get_dep_ports {portname recursive} {
                         ui_error "Unable to open port $depname: $result"
                         continue
                     }
-                    set portinfo [dict merge $portinfo [mportinfo $mport]]
+                    set portinfo [mportinfo $mport]
                     mportclose $mport
 
                     # collect its deps
@@ -923,7 +944,7 @@ proc get_subports {portname} {
             return -code error "Unable to open port $portname: $result"
         }
     }
-    set portinfo [dict merge $portinfo [mportinfo $mport]]
+    set portinfo [mportinfo $mport]
     mportclose $mport
 
     # gather its subports
@@ -1727,7 +1748,7 @@ proc action_info { action portlist opts } {
                 break_softcontinue "Unable to open port: $result" 1 status
             }
             dict unset options subport
-            set portinfo [dict merge $portinfo [mportinfo $mport]]
+            set portinfo [dict merge [dict filter $portinfo key portdir porturl] [mportinfo $mport]]
             mportclose $mport
         } elseif {$portinfo eq ""} {
             ui_warn "no PortIndex entry found for $portname"
@@ -1912,7 +1933,7 @@ proc action_info { action portlist opts } {
                 }
             } elseif {$opt eq "fullname"} {
                 set inf "[dict get $portinfo name] @"
-                append inf [composite_version [dict get $portinfo version] [dict get $portinfo active_variants]]
+                append inf [composite_version [dict get $portinfo version] [expr {[dict exists $portinfo active_variants] ? [dict get $portinfo active_variants] : {}}]]
                 set ropt "fullname"
             } else {
                 # Map from friendly name
@@ -2116,18 +2137,8 @@ proc action_notes { action portlist opts } {
     set status 0
     set gvariations [dict create {*}[array get global_variations]]
     foreachport $portlist {
-        if {$porturl eq ""} {
-            # Look up the port.
-            if {[catch {mportlookup $portname} result]} {
-                ui_debug $::errorInfo
-                break_softcontinue "The lookup of '$portname' failed: $result" \
-                                1 status
-            }
-            if {[llength $result] < 2} {
-                break_softcontinue "The port '$portname' was not found" 1 status
-            }
-
-            # Retrieve the port's URL.
+        if {$porturl eq "" && ![catch {mportlookup $portname} result] && $result ne ""} {
+            # Retrieve the port's URL from the index.
             lassign $result portname portinfo
             set porturl [dict get $portinfo porturl]
         }
@@ -2140,12 +2151,32 @@ proc action_notes { action portlist opts } {
         }
 
         # Open the Portfile associated with this port.
-        if {[catch {set mport [mportopen $porturl $options \
-                                         $merged_variations]} \
-                   result]} {
-            ui_debug $::errorInfo
-            break_softcontinue [concat "The URL '$porturl' could not be" \
-                                       "opened: $result"] 1 status
+        if {$porturl ne ""} {
+            if {[catch {set mport [mportopen $porturl $options \
+                                             $merged_variations]} \
+                       result]} {
+                ui_debug $::errorInfo
+                break_softcontinue [concat "The URL '$porturl' could not be" \
+                                           "opened: $result"] 1 status
+            }
+        } else {
+            # Not in the tree, so try to open a matching port from the registry
+            set composite_version [composite_version $portversion $variations]
+            set regref [registry_installed $portname $composite_version yes yes]
+            if {$regref eq {}} {
+                set regrefs [registry_installed $portname $composite_version yes no]
+                # Try to use the latest version installed
+                set regref [lindex [portlist_sortregrefs $regrefs] end]
+                if {$regref eq {}} {
+                    set maybe_vers [expr {$composite_version ne "" ? " @$composite_version" : ""}]
+                    break_softcontinue "The port '$portname${maybe_vers}' could not be found." 1 status
+                }
+            }
+            if {[catch {set mport [mportopen_installed [$regref name] [$regref version] \
+                    [$regref revision] [$regref variants] $options]} result]} {
+                ui_debug $::errorInfo
+                break_softcontinue "The port '$portname @[$regref version]_[$regref revision][$regref variants]' could not be opened: $result" 1 status
+            }
         }
         set portinfo [mportinfo $mport]
         mportclose $mport
@@ -2612,17 +2643,16 @@ proc action_upgrade { action portlist opts } {
 
     # shared depscache for all ports in the list
     array set depscache {}
-    set status 0
+    set portnames [list]
+    set argdict [dict create]
     foreachport $portlist {
-        if {![info exists depscache(port:$portname)]} {
-            set status [macports::upgrade $portname "port:$portname" $requested_variations $options depscache]
-            # status 2 means the port was not found in the index,
-            # status 3 means the port is not installed
-            if {$status != 0 && $status != 2 && $status != 3 && ![macports::ui_isset ports_processall]} {
-                break
-            }
-        }
+        lappend portnames $portname
+        dict set argdict $portname dspec port:$portname
+        dict set argdict $portname variations $requested_variations
+        dict set argdict $portname options $options
     }
+    set upgrade_options [dict create ignore_unindexed 1 ignore_uninstalled 1]
+    set status [macports::upgrade_multi $portnames $argdict $upgrade_options depscache]
 
     if {$status != 0 && $status != 2 && $status != 3} {
         print_tickets_url
@@ -2681,9 +2711,9 @@ proc action_dependents { action portlist opts } {
     foreachport $portlist {
         set composite_version [composite_version $portversion $variations]
         # choose the active version if there is one
-        set ilist [registry_installed $portname $composite_version no yes]
+        set ilist [registry_installed $portname $composite_version all yes]
         if {$ilist eq ""} {
-            set ilist [registry_installed $portname $composite_version no no]
+            set ilist [registry_installed $portname $composite_version all no]
         }
         if {$ilist eq ""} {
             break_softcontinue "[string trim "$portname $composite_version"] is not installed" 1 status
@@ -2846,7 +2876,7 @@ proc action_deps { action portlist opts } {
                 ui_debug "$::errorInfo"
                 break_softcontinue "Unable to open port: $result" 1 status
             }
-            set portinfo [dict merge $portinfo [mportinfo $mport]]
+            set portinfo [mportinfo $mport]
             mportclose $mport
         } elseif {$portinfo eq ""} {
             ui_warn "port ${action} --index does not work with the 'current' pseudo-port"
@@ -2926,7 +2956,7 @@ proc action_deps { action portlist opts } {
                             ui_debug "$::errorInfo"
                             break_softcontinue "Unable to open port: $result" 1 status
                         }
-                        set portinfo [dict merge $portinfo [mportinfo $mport]]
+                        set portinfo [mportinfo $mport]
                         mportclose $mport
                     }
 
@@ -3029,33 +3059,53 @@ proc action_uninstall { action portlist opts } {
         return 1
     }
 
+    # Confirm uninstallation if it looks like all active ports have
+    # been specified, provided that is a reasonably large number.
+    global macports::ui_options
+    if {[info exists ui_options(questions_yesno)]} {
+        set portlist_len [llength $portlist]
+        if {$portlist_len > 5 && $portlist_len >= [llength [registry::entry installed]]} {
+            set retvalue [$ui_options(questions_yesno) {} "UninstallMany" {} {n} 0 "Uninstall $portlist_len ports?"]
+            if {$retvalue != 0} {
+                return 0
+            }
+        }
+    }
+
     set portlist [portlist_sortdependents $portlist]
 
     foreachport $portlist {
-        if {[registry::entry imaged $portname] eq ""} {
+        set composite_version [composite_version $portversion $variations]
+        if {[catch {registry_installed $portname $composite_version selected} matches]} {
+            break_softcontinue "port uninstall failed: $matches" 1 status
+        }
+        if {$matches eq ""} {
             # if the code path arrives here the port either isn't installed, or
             # it doesn't exist at all. We can't be sure, but we can check the
             # portindex whether a port by that name exists (in which case not
             # uninstalling it is probably no problem). If there is no port by
             # that name, alert the user in case of typos.
-            ui_info "$portname is not installed"
-            if {[catch {set res [mportlookup $portname]} result] || [llength $res] == 0} {
+            set maybe_vers [expr {$composite_version ne "" ? " @$composite_version" : ""}]
+            ui_info "${portname}${maybe_vers} is not installed"
+            if {![catch {mportlookup $portname} res] && $res eq ""} {
                 ui_warn "no such port: $portname, skipping uninstall"
             }
             continue
         }
-        set composite_version [composite_version $portversion $variations]
-        if {![dict exists $options ports_uninstall_no-exec]
-            && ![catch {registry_installed $portname $composite_version} regref]} {
 
-            if {[registry::run_target $regref uninstall $options]} {
+        foreach regref $matches {
+            if {![dict exists $options ports_uninstall_no-exec]
+                    && [registry::run_target $regref uninstall $options]} {
                 continue
             }
+            if {[catch {registry_uninstall::uninstall [$regref name] [$regref version] [$regref revision] [$regref variants] $options} result]} {
+                ui_debug $::errorInfo
+                break_softcontinue "port uninstall failed: $result" 1 status
+            }
         }
-
-        if { [catch {registry_uninstall::uninstall_composite $portname $composite_version $options} result] } {
-            ui_debug $::errorInfo
-            break_softcontinue "port uninstall failed: $result" 1 status
+        # Handle possible break_softcontinue from inner loop
+        if {$status != 0} {
+            break
         }
     }
 
@@ -3073,7 +3123,7 @@ proc action_installed { action portlist opts } {
         set restrictedList 1
         foreachport $portlist {
             set composite_version [composite_version $portversion $variations]
-            if {[catch {lappend ilist {*}[registry_installed $portname $composite_version no no]} result]} {
+            if {[catch {lappend ilist {*}[registry_installed $portname $composite_version all no]} result]} {
                 ui_debug $::errorInfo
                 break_softcontinue "port installed failed: $result" 1 status
             }
@@ -3137,7 +3187,7 @@ proc action_outdated { action portlist opts } {
         foreach portspec $portlist {
             set portname [dict get $portspec name]
             set composite_version [composite_version [dict get $portspec version] [dict get $portspec variants]]
-            if {[catch {lappend ilist {*}[registry_installed $portname $composite_version no yes]} result]} {
+            if {[catch {lappend ilist {*}[registry_installed $portname $composite_version all yes]} result]} {
                 ui_debug $::errorInfo
                 break_softcontinue "port outdated failed: $result" 1 status
             }
@@ -3278,15 +3328,18 @@ proc action_contents { action portlist opts } {
     }
 
     foreachport $portlist {
+        if {$portname eq {}} {
+            break_softcontinue "port contents failed: a port name is required" 1 status
+        }
         set composite_version [composite_version $portversion $variations]
         set ilist ""
-        if {[catch {set ilist [registry_installed $portname $composite_version no yes]} result]} {
+        if {[catch {set ilist [registry_installed $portname $composite_version all yes]} result]} {
             ui_debug $::errorInfo
             break_softcontinue "port contents failed: $result" 1 status
         }
         if {$ilist ne ""} {
             set regref [lindex $ilist 0]
-        } elseif {[catch {set regref [registry_installed $portname $composite_version yes no]} result]} {
+        } elseif {[catch {set regref [registry_installed $portname $composite_version no no]} result]} {
             ui_debug $::errorInfo
             break_softcontinue "port contents failed: $result" 1 status
         }
@@ -3414,7 +3467,7 @@ proc action_variants { action portlist opts } {
                 ui_debug "$::errorInfo"
                 break_softcontinue "Unable to open port: $result" 1 status
             }
-            set portinfo [dict merge $portinfo [mportinfo $mport]]
+            set portinfo [mportinfo $mport]
             mportclose $mport
         } elseif {$portinfo eq ""} {
             ui_warn "port variants --index does not work with 'current' pseudo-port"
@@ -3669,7 +3722,13 @@ proc action_list { action portlist opts } {
             if {[dict exists $portinfo portdir]} {
                 set outdir [dict get $portinfo portdir]
             }
-            puts [format "%-30s @%-14s %s" [dict get $portinfo name] [dict get $portinfo version] $outdir]
+            if {[dict exists $portinfo version]} {
+                set version [dict get $portinfo version]
+            } else {
+                set version {}
+                ui_warn "required option 'version' is missing for $name"
+            }
+            puts [format "%-30s @%-14s %s" $name $version $outdir]
         }
     }
 
@@ -3835,7 +3894,7 @@ proc action_portcmds { action portlist opts } {
 
                     # If not available, get the homepage for the port by opening the Portfile
                     if {$homepage eq "" && ![catch {set ctx [mportopen $porturl]} result]} {
-                        set portinfo [dict merge $portinfo [mportinfo $ctx]]
+                        set portinfo [mportinfo $ctx]
                         if {[dict exists $portinfo homepage]} {
                             set homepage [dict get $portinfo homepage]
                         }
@@ -3879,7 +3938,7 @@ proc action_target { action portlist opts } {
     if {[require_portlist portlist]} {
         return 1
     }
-    if {($action eq "install" || $action eq "archive") && ![macports::global_option_isset ports_dryrun] && [prefix_unwritable]} {
+    if {$action in {install archive} && ![macports::global_option_isset ports_dryrun] && [prefix_unwritable]} {
         return 1
     }
     set status 0
@@ -3960,10 +4019,14 @@ proc action_target { action portlist opts } {
             if {![dict exists $options ports_install_unrequested]} {
                 dict set options ports_requested 1
             }
-            # we actually activate as well
-            set target activate
-        } elseif {$action eq "archive"} {
-            set target install
+            # signal intent to install
+            dict set options mport_hint_install 1
+            # we actually activate as well by default
+            if {![dict exists $options ports_install_no-activate]} {
+                set target activate
+            } else {
+                set target install
+            }
         } else {
             set target $action
         }
@@ -4236,7 +4299,7 @@ set cmd_opts_array [dict create {*}{
     space       {{units 1} total}
     activate    {no-exec}
     deactivate  {no-exec}
-    install     {allow-failing no-replace no-rev-upgrade unrequested}
+    install     {allow-failing no-activate no-replace no-rev-upgrade unrequested}
     uninstall   {follow-dependents follow-dependencies no-exec}
     variants    {index}
     clean       {all archive dist work logs}
@@ -4247,7 +4310,7 @@ set cmd_opts_array [dict create {*}{
     upgrade     {force enforce-variants no-replace no-rev-upgrade}
     rev-upgrade {id-loadcmd-check}
     diagnose    {quiet}
-    reclaim     {enable-reminders disable-reminders}
+    reclaim     {enable-reminders disable-reminders keep-build-deps}
     fetch       {no-mirrors}
     bump        {patch}
     snapshot    {create list {diff 1} all {delete 1} help {note 1} {export 1} {import 1}}

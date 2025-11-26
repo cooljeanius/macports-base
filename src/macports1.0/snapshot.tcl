@@ -54,29 +54,25 @@ namespace eval snapshot {
         # Returns:
         #           registry::snapshot
 
-        if {![dict exists $opts options_snapshot_order]} {
-            set operation "create"
-        } else {
-            set operation ""
-            foreach op {list create diff delete export import} {
-                set opname "ports_snapshot_$op"
-                if {[dict exists $opts $opname]} {
-                    if {$operation ne ""} {
-                        ui_error "Only one of the --list, --create, --diff, --delete, --export, or --import options can be specified."
-                        error "Incorrect usage, see port snapshot --help."
-                    }
-
-                    set operation $op
-                }
-            }
-        }
-
         if {[dict exists $opts ports_snapshot_help]} {
             print_usage
             return 0
         }
 
+        set operation ""
+        foreach op {list create diff delete export import} {
+            set optname ports_snapshot_$op
+            if {[dict exists $opts $optname]} {
+                if {$operation ne ""} {
+                    ui_error "Only one of the --list, --create, --diff, --delete, --export, or --import options can be specified."
+                    error "Incorrect usage, see port snapshot --help."
+                }
+                set operation $op
+            }
+        }
+
         switch $operation {
+            "" -
             "create" {
                 if {[catch {create $opts} result]} {
                     ui_error "Failed to create snapshot: $result"
@@ -94,13 +90,24 @@ namespace eval snapshot {
                     return 0
                 }
 
+                # Convert UTC datetimes to local timezone
+                set timestamps [dict create]
+                foreach snapshot $snapshots {
+                    set created_at_seconds [clock scan [$snapshot created_at] -timezone :UTC -format "%Y-%m-%d %T"]
+                    dict set timestamps $snapshot [clock format $created_at_seconds -format "%Y-%m-%d %T%z"]
+                }
+
                 set lens [dict create id [string length "ID"] created_at [string length "Created"] note [string length "Note"]]
                 foreach snapshot $snapshots {
-                    foreach fieldname {id created_at note} {
+                    foreach fieldname {id note} {
                         set len [string length [$snapshot $fieldname]]
                         if {[dict get $lens $fieldname] < $len} {
                             dict set lens $fieldname $len
                         }
+                    }
+                    set len [string length [dict get $timestamps $snapshot]]
+                    if {[dict get $lens created_at] < $len} {
+                        dict set lens created_at $len
                     }
                 }
 
@@ -112,7 +119,7 @@ namespace eval snapshot {
                     ui_msg [string repeat "=" [string length $heading]]
                 }
                 foreach snapshot $snapshots {
-                    ui_msg [format $formatStr [dict get $lens id] [$snapshot id] [dict get $lens created_at] [$snapshot created_at] [dict get $lens note] [$snapshot note]]
+                    ui_msg [format $formatStr [dict get $lens id] [$snapshot id] [dict get $lens created_at] [dict get $timestamps $snapshot] [dict get $lens note] [$snapshot note]]
                 }
 
                 return 0
@@ -189,7 +196,7 @@ namespace eval snapshot {
                 return 0
             }
             "delete" {
-                return [delete_snapshot $opts]
+                return [delete_snapshot [dict get $opts ports_snapshot_delete]]
             }
             "export" {
                 if {[catch {set snapshot [registry::snapshot get_by_id [dict get $opts ports_snapshot_export]]} result]} {
@@ -354,10 +361,6 @@ namespace eval snapshot {
         }
 
         global registry::tdbc_connection
-        if {![info exists tdbc_connection]} {
-            registry::tdbc_connect
-        }
-
         variable import_snapshot_stmt
         variable import_port_stmt
         variable import_file_stmt
@@ -464,7 +467,7 @@ namespace eval snapshot {
                 }
             }
             if {[llength $inactive_ports] != 0} {
-                set msg "Following inactive ports will not be a part of this snapshot and won't be installed while restoring:"
+                set msg "The following inactive ports will not be a part of this snapshot and won't be installed while restoring:"
                 set inactive_ports [lsort -index 0 -nocase $inactive_ports]
                 if {[info exists macports::ui_options(questions_yesno)]} {
                     set retvalue [$macports::ui_options(questions_yesno) $msg "Continue?" $inactive_ports {y} 0]
@@ -486,12 +489,8 @@ namespace eval snapshot {
 
     # Remove a snapshot from the registry. Not called 'delete' to avoid
     # confusion with the proc in portutil.
-    proc delete_snapshot {opts} {
+    proc delete_snapshot {snapshot_id} {
         global registry::tdbc_connection
-        if {![info exists tdbc_connection]} {
-            registry::tdbc_connect
-        }
-        set snapshot_id [dict get $opts ports_snapshot_delete]
         if {[catch {registry::snapshot get_by_id $snapshot_id}]} {
             ui_error "No such snapshot ID: $snapshot_id"
             return 1
@@ -515,9 +514,6 @@ namespace eval snapshot {
     # Get the port name that owns the given file path in the given snapshot.
     proc file_owner {path snapshot_id} {
         global registry::tdbc_connection
-        if {![info exists tdbc_connection]} {
-            registry::tdbc_connect
-        }
         variable file_owner_stmt
         if {![info exists file_owner_stmt]} {
             set query {SELECT snapshot_ports.port_name FROM snapshot_ports
@@ -535,9 +531,6 @@ namespace eval snapshot {
 
     proc port_files {snapshot_id port_name} {
         global registry::tdbc_connection
-        if {![info exists tdbc_connection]} {
-            registry::tdbc_connect
-        }
         variable port_files_stmt
         if {![info exists port_files_stmt]} {
             set port_files_stmt [$tdbc_connection prepare {

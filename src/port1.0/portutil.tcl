@@ -1431,10 +1431,9 @@ proc target_run {ditem} {
 
                 #start tracelib
                 set tracing no
-                if {($result == 0
+                if {$result == 0
                   && [tbool ports_trace]
-                  && $target ne "clean"
-                  && $target ne "uninstall")} {
+                  && $target ni {clean uninstall}} {
                     # uninstall will open a portfile from registry and call
                     # deactivate and uninstall there; if we enable trace mode
                     # for the first level the two trace threads will conflict
@@ -1443,10 +1442,7 @@ proc target_run {ditem} {
 
                     # Enable the fence to prevent any creation/modification
                     # outside the sandbox.
-                    if {$target ne "activate"
-                      && $target ne "deactivate"
-                      && $target ne "archive"
-                      && $target ne "install"} {
+                    if {$target ni {activate archive deactivate install}} {
                         porttrace::trace_enable_fence
                     }
 
@@ -1551,8 +1547,7 @@ proc target_run {ditem} {
                 # Check dependencies & file creations outside workpath.
                 if {[tbool ports_trace]
                   && $tracing
-                  && $target ne "clean"
-                  && $target ne "uninstall"} {
+                  && $target ni {clean uninstall}} {
 
                     tracelib closesocket
 
@@ -1687,6 +1682,13 @@ proc eval_targets {target} {
                 }
                 return $result
             }
+        } elseif {$target eq "archive"} {
+            # run the archive target but ignore its (completed) dependencies
+            set result [target_run [lindex [dlist_search $dlist provides $target] 0]]
+            if {[getuid] == 0 && [geteuid] != 0} {
+                seteuid 0; setegid 0
+            }
+            return $result
         }
     }
 
@@ -1727,6 +1729,47 @@ proc eval_targets {target} {
     return $result
 }
 
+# Traditional build subdir based on portpath
+proc portutil::get_oldbuildpath {} {
+    global portbuildpath portpath
+    return [file join [file dirname $portbuildpath] [string map {:// . / _} $portpath]]
+}
+
+proc portutil::create_workpath {} {
+    global workpath subbuildpath subport
+    if {[getuid] == 0 && [geteuid] != 0} {
+        elevateToRoot create_workpath
+    }
+    set old_buildpath [get_oldbuildpath]
+    set old_subbbuildpath [file join $old_buildpath $subport]
+    file mkdir $old_buildpath $subbuildpath
+    set norm_old_workpath [file normalize ${old_subbbuildpath}/work]
+    # Link and/or move build dir if link or link target are missing or incorrect.
+    if {$norm_old_workpath ne $workpath} {
+        if {![catch {file type $old_subbbuildpath} ftype]} {
+            if {$ftype eq "directory"} {
+                # pre-2.11 build dir, move to new location
+                delete $subbuildpath
+                file rename $old_subbbuildpath $subbuildpath
+            } elseif {$ftype eq "link" && [file isdirectory $old_subbbuildpath]} {
+                # link to older 2.11.x build dir, rename
+                delete $subbuildpath
+                file rename [realpath $old_subbbuildpath] $subbuildpath
+            } else {
+                # broken link or something unexpected
+                delete $old_subbbuildpath
+            }
+            file attributes $subbuildpath -permissions 0755
+        }
+        ln -sf $subbuildpath $old_subbbuildpath
+        chownAsRoot $old_subbbuildpath
+    }
+
+    file mkdir $workpath/.home $workpath/.tmp
+    file attributes $workpath -permissions 0755
+    chownAsRoot $subbuildpath
+}
+
 # open_statefile
 # open file to store name of completed targets
 proc open_statefile {args} {
@@ -1734,23 +1777,8 @@ proc open_statefile {args} {
            subbuildpath
 
     if {![tbool ports_dryrun]} {
-        set need_chown 0
-        if {![file isdirectory $workpath/.home]} {
-            if {[getuid] == 0 && [geteuid] != 0} {
-                elevateToRoot create_workpath
-            }
-            file mkdir $workpath/.home
-            set need_chown 1
-        }
-        if {![file isdirectory $workpath/.tmp]} {
-            if {[getuid] == 0 && [geteuid] != 0} {
-                elevateToRoot create_workpath
-            }
-            file mkdir $workpath/.tmp
-            set need_chown 1
-        }
-        if {$need_chown} {
-            chownAsRoot $subbuildpath
+        if {![file isdirectory $workpath/.home] || ![file isdirectory $workpath/.tmp]} {
+            portutil::create_workpath
         }
         # Create a symlink to the workpath for port authors
         if {[tbool place_worksymlink] && ![file isdirectory $worksymlink]} {
@@ -2156,7 +2184,11 @@ proc check_variants {target} {
     }
     if {$statereq} {
 
-        set state_fd [open_statefile]
+        if {[catch {set state_fd [open_statefile]} err]} {
+            ui_debug $::errorInfo
+            ui_error "Failed to open statefile for $PortInfo(name): $err"
+            return 1
+        }
 
         if {![tbool ports_force] && [check_statefile_variants variations oldvariations $state_fd]} {
             ui_error "Requested variants \"[canonicalize_variants $variations]\" do not match those the build was started with: \"[canonicalize_variants $oldvariations]\"."
@@ -2807,19 +2839,7 @@ proc extract_archive_metadata {archive_location archive_type metadata_types} {
     switch -- $archive_type {
         tbz -
         tbz2 {
-            global os.major os.platform
-            if {${os.major} == 8 && ${os.platform} eq "darwin"} {
-                # https://trac.macports.org/ticket/70622
-                set tar_cmd [string cat [findBinary tar ${portutil::autoconf::tar_path}] \
-                     " -xOj${qflag}f [shellescape $archive_location] ./+CONTENTS" \
-                     " 2>/dev/null || true"]
-                set raw_contents [exec -ignorestderr /bin/sh -c $tar_cmd]
-                if {$raw_contents eq ""} {
-                    error "extracting +CONTENTS from $archive_location failed"
-                }
-            } else {
-                set raw_contents [exec -ignorestderr [findBinary tar ${portutil::autoconf::tar_path}] -xOj${qflag}f $archive_location ./+CONTENTS]
-            }
+            set raw_contents [exec -ignorestderr [findBinary tar ${portutil::autoconf::tar_path}] -xOj${qflag}f $archive_location ./+CONTENTS]
         }
         tgz {
             set raw_contents [exec -ignorestderr [findBinary tar ${portutil::autoconf::tar_path}] -xOz${qflag}f $archive_location ./+CONTENTS]
@@ -3179,6 +3199,24 @@ proc exec_as_uid {uid code} {
     return -code $retcode $result
 }
 
+# Run the given code, becoming root first if possible, and dropping
+# privileges again afterward.
+proc exec_with_available_privileges {code} {
+    if {[getuid] == 0 && [geteuid] != 0} {
+        seteuid 0; setegid 0
+        set deprivileged 1
+    }
+    try {
+        uplevel 1 $code
+    } finally {
+        if {[info exists deprivileged]} {
+            global macportsuser
+            setegid [uname_to_gid $macportsuser]
+            seteuid [name_to_uid $macportsuser]
+        }
+    }
+}
+
 # dependency analysis helpers
 
 ### _libtest is private; subject to change without notice
@@ -3382,7 +3420,7 @@ proc _check_xcode_version {} {
                     ui_warn "You can install them as part of the Xcode Command Line Tools package by running `xcode-select --install'."
                 } else {
                     ui_warn "You can install them as part of the Xcode Command Line Tools package from Xcode's Preferences in the Downloads section."
-                    ui_warn "See https://guide.macports.org/chunked/installing.xcode.html#installing.xcode.lion.43 for more information."
+                    ui_warn "See https://guide.macports.org/chunked/installing.html#installing.xcode.lion.43 for more information."
                 }
             }
 
@@ -3401,6 +3439,10 @@ proc _check_xcode_version {} {
                     } else {
                         ui_warn "The macOS ${configure.sdk_version} SDK does not appear to be installed. This port may not build correctly."
                     }
+                } elseif {$xcodecltversion ne "none" && [vercmp $xcodecltversion >= 16]
+                          && [file exists ${cltpath}/usr/include/c++/v1]} {
+                    ui_warn "Old C++ headers are present, which may cause build failures with Command Line Tools v16+."
+                    ui_warn "Please see: <https://trac.macports.org/wiki/ProblemHotlist#clts16>"
                 }
             }
 
@@ -3424,71 +3466,165 @@ proc _check_xcode_version {} {
     return 0
 }
 
-# check if we can unarchive this port
-proc _archive_available {} {
-    global ports_source_only porturl portutil::archive_available_result
+# Get a head start on things that will need to be done when this port
+# is installed.
+proc portutil::_prep_install {} {
+    _eval_archive_available yes
+}
 
+# Clean up any asynchronous actions in progress
+proc portutil::_async_cleanup {} {
+    variable archive_available_curl_reqid
+    if {[info exists archive_available_curl_reqid]} {
+        curlwrap_async_cancel $archive_available_curl_reqid
+        unset archive_available_curl_reqid
+    }
+}
+
+proc portutil::_archive_available_ready {} {
+    variable archive_available_result
+    return [info exists archive_available_result]
+}
+
+# Helper function to do the potentially expensive first evaluation of
+# _archive_available, optionally asynchronously.
+proc portutil::_eval_archive_available {{async no}} {
+    variable archive_available_result
     if {[info exists archive_available_result]} {
-        return $archive_available_result
+        return
     }
 
+    variable archive_available_curl_reqid
+    if {[info exists archive_available_curl_reqid]} {
+        if {!$async} {
+            lassign [curlwrap_async_result $archive_available_curl_reqid] status data
+            unset archive_available_curl_reqid
+            if {$status == 0} {
+                # success
+                set archive_available_result $data
+            } else {
+                # error
+                ui_debug "curlwrap_async failed: $data"
+                set archive_available_result 0
+            }
+        }
+        return
+    }
+
+    global ports_source_only
     if {[tbool ports_source_only]} {
         set archive_available_result 0
-        return 0
+        return
     }
 
     if {[find_portarchive_path] ne ""} {
         set archive_available_result 1
-        return 1
+        return
     }
 
+    global porturl
     set archiverootname [file rootname [get_portimage_name]]
     if {[file rootname [file tail $porturl]] eq $archiverootname && [file extension $porturl] ne ""} {
         set archive_available_result 1
-        return 1
+        return
     }
 
-    # check if there's an archive available on the server
-    global archive_sites
+    # check if there's an archive on the primary or local servers
+    global archive_sites env
     set mirrors macports_archives
     if {[lsearch $archive_sites macports_archives::*] == -1} {
         set mirrors [lindex [split [lindex $archive_sites 0] :] 0]
     }
     if {$mirrors eq {}} {
         set archive_available_result 0
-        return 0
+        return
     }
     set archivetype $portfetch::mirror_sites::archive_type($mirrors)
-    set archivename "${archiverootname}.${archivetype}"
-    # grab first site, should conventionally be the master mirror
-    set sites_entry [lindex $portfetch::mirror_sites::sites($mirrors) 0]
-    # look for and strip off any tag, which will start with the first colon after the
-    # first slash after the ://
-    set lastcolon [string last : $sites_entry]
-    set aftersep [expr {[string first : $sites_entry] + 3}]
-    set firstslash [string first / $sites_entry $aftersep]
-    if {$firstslash != -1 && $firstslash < $lastcolon} {
-        incr lastcolon -1
-        set site [string range $sites_entry 0 $lastcolon]
+    if {[info exists portfetch::mirror_sites::archive_sigtype($mirrors)]} {
+        set sigtype $portfetch::mirror_sites::archive_sigtype($mirrors)
     } else {
-        set site $sites_entry
+        set sigtype rmd160
     }
-    if {[string index $site end] ne "/"} {
-        append site /
+    set archivename ${archiverootname}.${archivetype}
+    set sites_entries [list]
+    if {[info exists env(ARCHIVE_SITE_LOCAL)]} {
+        lappend sites_entries {*}$env(ARCHIVE_SITE_LOCAL)
     }
-    append site [option archive.subdir]
-    set url [portfetch::assemble_url $site $archivename]
-    ui_debug "Fetching $archivename archive size"
-    # curl getsize can return -1 instead of throwing an error for
-    # nonexistent files on FTP sites.
-    if {![catch {curl getsize $url} size] && $size > 0
-          && ![catch {curl getsize ${url}.rmd160} sigsize] && $sigsize > 0} {
-        set archive_available_result 1
-        return 1
+    # grab first site, should conventionally be the master mirror
+    set primary_mirror [lindex $portfetch::mirror_sites::sites($mirrors) 0]
+    # Find mirror with fastest cached ping time
+    global portfetch::hostregex
+    regexp $hostregex $primary_mirror -> primary_host
+    set fastest_mirror {}
+    set best_ping [get_pingtime $primary_host]
+    set best_ping [expr {$best_ping ne {} && $best_ping != -1 ? $best_ping : 10000}]
+    if {$best_ping > 0} {
+        foreach mirror [lrange $portfetch::mirror_sites::sites($mirrors) 1 end] {
+            regexp $hostregex $mirror -> cur_host
+            set cur_ping [get_pingtime $cur_host]
+            if {$cur_ping ne {} && $cur_ping >= 0 && $cur_ping < $best_ping} {
+                set best_ping $cur_ping
+                set fastest_mirror $mirror
+                if {$cur_ping == 0} {
+                    break
+                }
+            }
+        }
+    }
+    if {$fastest_mirror ne {}} {
+        lappend sites_entries $fastest_mirror
+    }
+    lappend sites_entries $primary_mirror
+    # Build list of URLs to check for the archive and its signature.
+    set sites [list]
+    set urls [list]
+    foreach sites_entry $sites_entries {
+        # look for and strip off any tag, which will start with the first colon after the
+        # first slash after the ://
+        set lastcolon [string last : $sites_entry]
+        set aftersep [expr {[string first : $sites_entry] + 3}]
+        set firstslash [string first / $sites_entry $aftersep]
+        if {$firstslash != -1 && $firstslash < $lastcolon} {
+            set site [string range $sites_entry 0 ${lastcolon}-1]
+        } else {
+            set site $sites_entry
+        }
+        set orig_site $site
+        if {[string index $site end] ne "/"} {
+            append site /
+        }
+        set url [portfetch::assemble_url ${site}[option archive.subdir] $archivename]
+        lappend sites $orig_site $orig_site
+        lappend urls $url ${url}.${sigtype}
     }
 
-    set archive_available_result 0
-    return 0
+    if {$async} {
+        # Queue the check on a separate thread and return immediately.
+        set archive_available_curl_reqid \
+            [curlwrap_async archive_exists {} {} $sites $urls]
+    } else {
+        foreach {url sigurl} $urls {site sigsite} $sites {
+            ui_debug "Checking if $archivename exists at $site"
+            # curl getsize can return -1 instead of throwing an error for
+            # nonexistent files on FTP sites.
+            if {![catch {curlwrap getsize $orig_site {} $url} size] && $size > 0
+                  && ![catch {curlwrap getsize $orig_site {} ${url}.${sigtype}} sigsize] && $sigsize > 0} {
+                set archive_available_result 1
+                return
+            }
+        }
+        set archive_available_result 0
+    }
+}
+
+# check if we can unarchive this port
+proc _archive_available {} {
+    global portutil::archive_available_result
+
+    if {![info exists archive_available_result]} {
+        portutil::_eval_archive_available no
+    }
+    return $archive_available_result
 }
 
 # get the mountpoint providing a given directory
