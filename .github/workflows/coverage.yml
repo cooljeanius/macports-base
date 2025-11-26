@@ -43,7 +43,7 @@ jobs:
           LLVM_PROFILE_FILE="${PWD}/cov-%p.profraw" make test
       - name: Report Coverage
         run: |
-          set -eu
+          set -eux
           xcrun llvm-profdata merge --sparse --output=cov.profdata cov-*.profraw
           # tracelib cannot be profiled
           OBJ_FILES="$(find src -type f "(" -name "*.dylib" -o -name "*.a" ")" | grep -Fv darwintracelib1.0 | sed 's/^/--arch=arm64 --object=/')"
