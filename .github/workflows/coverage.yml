@@ -47,8 +47,17 @@ jobs:
           xcrun llvm-profdata merge --sparse --output=cov.profdata cov-*.profraw
           # tracelib cannot be profiled
           OBJ_FILES="$(find src -type f "(" -name "*.dylib" -o -name "*.a" ")" | grep -Fv darwintracelib1.0 | sed 's/^/--arch=arm64 --object=/')"
-          xcrun llvm-cov show --format=html --output-dir=covreport --ignore-filename-regex=vendor/ --instr-profile=cov.profdata "${OBJ_FILES}"
-          xcrun llvm-cov report --ignore-filename-regex=vendor/ --instr-profile=cov.profdata "${OBJ_FILES}"
+          echo "OBJ_FILES are '${OBJ_FILES}'."
+          if test -n "${OBJ_FILES}"; then
+            xcrun llvm-cov show --format=html --output-dir=covreport --ignore-filename-regex=vendor/ --instr-profile=cov.profdata "${OBJ_FILES}"
+            xcrun llvm-cov report --ignore-filename-regex=vendor/ --instr-profile=cov.profdata "${OBJ_FILES}"
+          elif test ! -d covreport; then
+            mkdir -pv covreport
+            touch covreport/cov.profdata
+            echo "" | tee -a covreport/cov.profdata
+          else
+            echo "Nothing to do."
+          fi
       - name: Archive code coverage results
         uses: actions/upload-artifact@v4
         with:
