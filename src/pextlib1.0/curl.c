@@ -273,6 +273,16 @@ CurlFetchCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 		int running; /* number of running transfers */
 		char* acceptEncoding = NULL;
 
+        /* allow cancelling asynchronous transfers */
+		int cancelled = 0;
+		if ((theResult = Tcl_LinkVar(interp,
+									 "::pextlib::curl::cancelled",
+									 (char *)&cancelled,
+									 TCL_LINK_BOOLEAN)) != TCL_OK) {
+			/* Tcl_LinkVar already sets an error message */
+			break;
+		}
+
 		/* we might have options and then the url and the file */
 		/* let's process the options first */
 
@@ -392,7 +402,9 @@ CurlFetchCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 		/* Open the file */
 		theFile = fopen(theFilePath, "w");
 		if (theFile == NULL) {
-			Tcl_SetResult(interp, strerror(errno), TCL_VOLATILE);
+			int errsave = errno;
+			Tcl_SetResult(interp, "Failed to open file ", TCL_STATIC);
+			Tcl_AppendResult(interp, theFilePath, " for writing: ", strerror(errsave), NULL);
 			theResult = TCL_ERROR;
 			break;
 		}
@@ -634,6 +646,13 @@ CurlFetchCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 			fd_set errorfds;
 			struct timeval timeout;
 
+            if (cancelled) {
+                /* Something requested to cancel the transfer */
+                Tcl_SetResult(interp, "Transfer cancelled", TCL_STATIC);
+                theResult = TCL_ERROR;
+				break;
+            }
+
 			long curl_timeout = -1;
 
 			/* curl_multi_timeout introduced in libcurl 7.15.4 */
@@ -695,6 +714,8 @@ CurlFetchCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 					break;
 				}
 			}
+			/* Service any pending events */
+			while (Tcl_DoOneEvent((TCL_ALL_EVENTS & ~TCL_IDLE_EVENTS)|TCL_DONT_WAIT)) {}
 		} while (running > 0);
 
 		/* Find out whether the transfer succeeded or failed. */
@@ -772,6 +793,8 @@ CurlFetchCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 				(effectiveURL == NULL || theCurlCode != CURLE_OK) ? "" : effectiveURL, 0);
 		}
 	} while (0);
+
+    Tcl_UnlinkVar(interp, "::pextlib::curl::cancelled");
 
 	if (handleAdded) {
 		/* Remove the handle from the multi handle, but ignore errors to avoid
@@ -1078,6 +1101,16 @@ CurlGetSizeCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 		char theSizeString[32];
 		double theFileSize;
 
+        /* allow cancelling asynchronous transfers */
+		int cancelled = 0;
+		if ((theResult = Tcl_LinkVar(interp,
+									 "::pextlib::curl::cancelled",
+									 (char *)&cancelled,
+									 TCL_LINK_BOOLEAN)) != TCL_OK) {
+			/* Tcl_LinkVar already sets an error message */
+			break;
+		}
+
 		optioncrsr = 2;
 		lastoption = objc - 2;
 		while (optioncrsr <= lastoption) {
@@ -1300,6 +1333,13 @@ CurlGetSizeCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 			fd_set errorfds;
 			struct timeval timeout;
 
+            if (cancelled) {
+                /* Something requested to cancel the transfer */
+                Tcl_SetResult(interp, "Transfer cancelled", TCL_STATIC);
+                theResult = TCL_ERROR;
+				break;
+            }
+
 			long curl_timeout = -1;
 
 			/* curl_multi_timeout introduced in libcurl 7.15.4 */
@@ -1426,6 +1466,8 @@ CurlGetSizeCmd(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 			"%.0f", theFileSize);
 		Tcl_SetResult(interp, theSizeString, TCL_VOLATILE);
 	} while (0);
+
+    Tcl_UnlinkVar(interp, "::pextlib::curl::cancelled");
 
     if (handleAdded) {
 		/* Remove the handle from the multi handle, but ignore errors to avoid

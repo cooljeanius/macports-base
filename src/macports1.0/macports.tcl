@@ -59,8 +59,8 @@ namespace eval macports {
         configureccache ccache_size configuredistcc configurepipe buildnicevalue buildmakejobs \
         universal_archs build_arch macosx_sdk_version macosx_deployment_target \
         macportsuser proxy_override_env proxy_http proxy_https proxy_ftp proxy_rsync proxy_skip \
-        master_site_local patch_site_local archive_site_local fetch_credentials buildfromsource \
-        revupgrade_autorun revupgrade_mode revupgrade_check_id_loadcmds \
+        master_site_local patch_site_local archive_site_local fetch_credentials fetch_threads \
+        buildfromsource revupgrade_autorun revupgrade_mode revupgrade_check_id_loadcmds \
         host_blacklist preferred_hosts sandbox_enable sandbox_network delete_la_files cxx_stdlib \
         default_compilers pkg_post_unarchive_deletions ui_interactive] {
             dict set bootstrap_options $opt {}
@@ -128,7 +128,7 @@ namespace eval macports {
     variable source_install_dep_types [list depends_fetch depends_extract depends_patch depends_build]
 
     # Which targets don't require building if the port is already installed
-    variable no_build_targets [dict create activate 1 archive 1 install 1 {} 1]
+    variable no_build_targets [dict create activate 1 archive 1 archivefetch 1 install 1 {} 1]
 }
 
 ##
@@ -992,6 +992,7 @@ proc mportinit {{up_ui_options {}} {up_options {}} {up_variations {}}} {
         macports::host_blacklist \
         macports::preferred_hosts \
         macports::fetch_credentials \
+        macports::fetch_threads \
         macports::keeplogs \
         macports::place_worksymlink \
         macports::revupgrade_autorun \
@@ -1068,6 +1069,9 @@ proc mportinit {{up_ui_options {}} {up_options {}} {up_variations {}}} {
 
     # Set the system encoding to utf-8
     encoding system utf-8
+
+    # Set up background error handler
+    interp bgerror {} macports::handle_bgerror
 
     # Set up signal handling for SIGTERM and SIGINT
     # Specifying error here will case the program to abort where it is with
@@ -1818,6 +1822,14 @@ match macports.conf.default."
         set fetch_credentials {}
     }
 
+    if {[info exists fetch_threads] && (![string is integer -strict $fetch_threads] || $fetch_threads < 1)} {
+        ui_error "fetch_threads must be a positive integer"
+        unset fetch_threads
+    }
+    if {![info exists fetch_threads]} {
+        set fetch_threads 2
+    }
+
     # Proxy handling (done this late since Pextlib is needed)
     if {![info exists proxy_override_env] || ![string is true -strict $proxy_override_env]} {
         set proxy_override_env no
@@ -2122,6 +2134,8 @@ proc macports::worker_init {workername portpath porturl portbuildpath options va
     $workername alias curlwrap_async macports::curlwrap_async
     $workername alias curlwrap_async_result macports::curlwrap_async_result
     $workername alias curlwrap_async_cancel macports::curlwrap_async_cancel
+    $workername alias curlwrap_async_is_complete macports::curlwrap_async_is_complete
+    $workername alias curlwrap_async_show_progress macports::curlwrap_async_show_progress
 
     foreach opt $portinterp_options {
         if {![info exists $opt]} {
@@ -2239,9 +2253,9 @@ proc macports::curlwrap {action site credentials args} {
 
 # Asynchronous version of curlwrap, takes multiple URLs and returns a
 # handle that can be used to get the result later.
-proc macports::curlwrap_async {action credentials fixed_args sites urls} {
+proc macports::curlwrap_async {action credentials fixed_args sites urls args} {
     set credential_args [lmap site $sites {_curlwrap_credential_args $site $credentials}]
-    return [mport_fetch_thread::queue $action [list $fixed_args $credential_args $urls]]
+    return [mport_fetch_thread::queue $action [list $fixed_args $credential_args $urls {*}$args]]
 }
 
 # Get the result of a curlwrap_async operation.
@@ -2252,6 +2266,16 @@ proc macports::curlwrap_async_result {id} {
 # Cancel a curlwrap_async operation in progress.
 proc macports::curlwrap_async_cancel {id} {
     return [mport_fetch_thread::cancel $id]
+}
+
+# Check if a curlwrap_async operation is complete.
+proc macports::curlwrap_async_is_complete {id args} {
+    return [mport_fetch_thread::is_complete $id {*}$args]
+}
+
+# Start displaying progress for an operation.
+proc macports::curlwrap_async_show_progress {id} {
+    return [mport_fetch_thread::show_progress $id]
 }
 
 ##
@@ -2695,9 +2719,11 @@ proc _mportsearchpath {depfilename search_path {executable 0} {return_match 0}} 
 
 # Determine if a port is already *installed*, as in "in the registry".
 proc _mportinstalled {mport} {
-    # Check for the presence of the port in the registry
-    set subport [ditem_key $mport provides]
-    return [expr {[registry::entry imaged $subport] ne ""}]
+    set portinfo [mportinfo $mport]
+    set reslist [registry::entry imaged [dict get $portinfo name] \
+                    [dict get $portinfo version] [dict get $portinfo revision] \
+                    [dict get $portinfo canonical_active_variants]]
+    return [expr {$reslist ne {}}]
 }
 
 # Determine if a port is active
@@ -2856,6 +2882,27 @@ proc _mportexec {target mport} {
     }
 }
 
+proc macports::async_fetch_mport {target mport} {
+    if {[global_option_isset ports_dryrun]} {
+        return
+    }
+    variable fetch_threads
+    if {$fetch_threads == 0} {
+        return
+    }
+    variable no_build_targets
+    set workername [ditem_key $mport workername]
+    if {[dict exists $no_build_targets $target] && ![global_option_isset ports_source_only]
+        && ![_mportinstalled $mport] && [$workername eval [list _archive_available]]
+    } then {
+        $workername eval [list portarchivefetch::archivefetch_async_start]
+    } elseif {[_target_needs_deps $target] && (![dict exists $no_build_targets $target]
+              || (![global_option_isset ports_binary_only] && ![_mportinstalled $mport]))
+    } then {
+        $workername eval [list portfetch::fetch_async_start]
+    }
+}
+
 # mportexec
 # Execute the specified target of the given mport.
 proc mportexec {mport target} {
@@ -2962,6 +3009,13 @@ proc mportexec {mport target} {
             }
         }
 
+        # Start background fetch of files
+        set result [dlist_eval $dlist _mportinstalled [list macports::async_fetch_mport activate]]
+        if {$result ne ""} {
+            ui_debug "Error starting asynchronous file fetch: $dlist_eval_reason"
+        }
+        macports::async_fetch_mport $target $mport
+
         # install them
         set result [dlist_eval $dlist _mportactive [list _mportexec activate]]
 
@@ -3012,6 +3066,7 @@ proc mportexec {mport target} {
             }
             return 1
         }
+        macports::async_fetch_mport $target $mport
     }
 
     # Build this port with the specified target
@@ -5568,6 +5623,10 @@ proc macports::_exec_upgrade {oplist upgrade_count} {
                     } elseif {$opname in {activate_only install} && ![dict exists $all_mports $mport]} {
                         lappend ports_to_upgrade [ditem_key $mport provides]
                     }
+                    if {$opname in {activate install}} {
+                        # Start background fetch of files
+                        async_fetch_mport activate $mport
+                    }
                     dict set all_mports $mport 0
                 }
             }
@@ -7284,4 +7343,25 @@ proc macports::get_compatible_xcode_versions {} {
         }
     }
     return [list $min $ok $rec]
+}
+
+# Handle errors that occur in background code. We're really only interested in signals.
+proc macports::handle_bgerror {result opts} {
+    set errorcode [dict get $opts -errorcode]
+    if {{POSIX SIG} eq [lrange $errorcode 0 1]} {
+        variable signal_caught [lindex $errorcode 2]
+    } else {
+        ui_debug "Error caught in background code: $errorcode $result"
+    }
+}
+
+# Error if an interrupt signal was received in the background
+proc macports::check_signals {} {
+    variable signal_caught
+    if {[info exists signal_caught]} {
+        set return_args [list -code error -errorcode [list POSIX SIG $signal_caught] "Aborted: $signal_caught signal received"]
+        # Reset the flag in case code that handles the error ends up calling this again.
+        unset signal_caught
+        return {*}$return_args
+    }
 }
