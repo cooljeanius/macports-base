@@ -46,7 +46,7 @@ jobs:
           set -eux
           xcrun llvm-profdata merge --sparse --output=cov.profdata cov-*.profraw
           # tracelib cannot be profiled
-          OBJ_FILES="$(find src -type f "(" -name "*.dylib" -o -name "*.a" ")" | grep -Fv darwintracelib1.0 | sed 's/^/--arch=arm64 --object=/')"
+          OBJ_FILES="$(find src -type f "(" -name "*.dylib" -o -name "*.a" ")" | grep -Fv darwintracelib1.0 | sed 's/^/--arch=arm64 --object=/' | tr \\n \ )"
           echo "OBJ_FILES are '${OBJ_FILES}'."
           if test -n "${OBJ_FILES}"; then
             xcrun -find llvm-cov
