@@ -50,8 +50,8 @@ jobs:
           echo "OBJ_FILES are '${OBJ_FILES}'."
           if test -n "${OBJ_FILES}"; then
             xcrun -find llvm-cov
-            xcrun llvm-cov show --format=html --output-dir=covreport --ignore-filename-regex=vendor/ --instr-profile=cov.profdata "${OBJ_FILES}"
-            xcrun llvm-cov report --ignore-filename-regex=vendor/ --instr-profile=cov.profdata "${OBJ_FILES}"
+            xcrun llvm-cov show --format=html --output-dir=covreport --ignore-filename-regex=vendor/ --instr-profile=cov.profdata ${OBJ_FILES}
+            xcrun llvm-cov report --ignore-filename-regex=vendor/ --instr-profile=cov.profdata ${OBJ_FILES}
           elif test ! -d covreport; then
             mkdir -pv covreport
             touch covreport/cov.profdata
