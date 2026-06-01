@@ -49,6 +49,7 @@ jobs:
           OBJ_FILES="$(find src -type f "(" -name "*.dylib" -o -name "*.a" ")" | grep -Fv darwintracelib1.0 | sed 's/^/--arch=arm64 --object=/')"
           echo "OBJ_FILES are '${OBJ_FILES}'."
           if test -n "${OBJ_FILES}"; then
+            xcrun -find llvm-cov
             xcrun llvm-cov show --format=html --output-dir=covreport --ignore-filename-regex=vendor/ --instr-profile=cov.profdata "${OBJ_FILES}"
             xcrun llvm-cov report --ignore-filename-regex=vendor/ --instr-profile=cov.profdata "${OBJ_FILES}"
           elif test ! -d covreport; then
