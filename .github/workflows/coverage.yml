@@ -60,7 +60,7 @@ jobs:
             echo "Nothing to do."
           fi
       - name: Archive code coverage results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: code-coverage-report
           path: covreport/
